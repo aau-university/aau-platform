@@ -1,0 +1,50 @@
+.motion-safe-transform {
+  will-change: transform;
+}
+
+.motion-safe-opacity {
+  will-change: opacity;
+}
+
+@keyframes shine-border-rotate {
+  from {
+    transform: translate(-50%, -50%) rotate(0deg);
+  }
+  to {
+    transform: translate(-50%, -50%) rotate(360deg);
+  }
+}
+
+.shine-border-rotate {
+  animation: shine-border-rotate var(--shine-duration) linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .motion-safe-transform,
+  .motion-safe-opacity {
+    animation: none !important;
+    opacity: 1 !important;
+    transform: none !important;
+    transition: none !important;
+    will-change: auto;
+  }
+
+  .animate-fade-in,
+  .animate-fade-in-up,
+  .animate-slide-in-left,
+  .animate-slide-in-right,
+  .animate-scale-in {
+    animation: none !important;
+    opacity: 1 !important;
+    transform: none !important;
+  }
+
+  .shine-border-rotate {
+    animation: none;
+    transform: translate(-50%, -50%);
+  }
+
+  .skeleton-pulse {
+    animation: none;
+  }
+}

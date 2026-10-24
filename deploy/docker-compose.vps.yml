@@ -1,0 +1,344 @@
+# Runtime-only stack for the university VPS. ONE file serves both environments.
+#
+# The environment is selected by the deploy scripts, which set COMPOSE_PROJECT_NAME
+# (aau-production / aau-staging) and the ports below. Compose project names are
+# the documented mechanism for running isolated copies of an application on one
+# host: volumes, networks and containers are namespaced by project, so staging's
+# `postgres-prod-data` is a different volume object from production's.
+#
+# Deliberately absent, and asserted absent by tests:
+#   - any app build context (the image is built once in CI, per release SHA);
+#   - the source-containing `operations` image;
+#   - a `migrate-prod` service — Payload applies pending migrations itself
+#     during `db.connect()`, from the migration list compiled into the image;
+#   - any Seed service. The broad Seed is never part of a normal start; it is a
+#     separate explicit one-shot operation (deploy/scripts/seed.sh).
+#   - a default for APP_IMAGE. See "Release identity" below.
+#
+# The VPS therefore needs no Git checkout, no pnpm, no `next build` and no
+# Payload CLI.
+#
+# Usage: always through deploy/scripts/deploy.sh or deploy/scripts/compose.sh,
+# which supply APP_IMAGE from the release-state file.
+
+x-logging: &logging
+  # Docker's default `json-file` driver does not rotate, which on a VPS that
+  # also stores PostgreSQL data and uploaded media makes log growth a plausible
+  # outage. The `local` driver rotates and compresses by default.
+  driver: local
+  options:
+    max-size: '20m'
+    max-file: '5'
+
+# ── Release identity ──────────────────────────────────────────────────────
+# APP_IMAGE has NO default and is NOT present in the env file. That is the
+# point: the release-state file (`<deploy-root>/deployed-image`) is the single
+# source of truth for what is deployed. If APP_IMAGE lived in the secrets file,
+# a bare `docker compose up` months later would silently resurrect whatever
+# release was written there — configuration outliving the release it described.
+# With no default, such a call fails loudly instead.
+x-app-image: &app-image
+  image: ${APP_IMAGE:?APP_IMAGE is not set. Use deploy/scripts/compose.sh, which reads the release-state file, or deploy/scripts/deploy.sh. Release identity deliberately does not live in the env file.}
+
+x-app-environment: &app-environment
+  NODE_ENV: production
+
+  # Payload connects as the non-superuser application role. The connection URI
+  # is assembled by the application from these discrete parts, so the password
+  # exists in exactly ONE place and is percent-encoded correctly for a URI
+  # without the operator having to do it (see src/lib/database-url.ts).
+  DATABASE_HOST: postgres-prod
+  DATABASE_PORT: '5432'
+  DATABASE_NAME: ${POSTGRES_DB:?POSTGRES_DB is required}
+  DATABASE_USER: ${APP_DB_USER:?APP_DB_USER is required}
+  DATABASE_PASSWORD: ${APP_DB_PASSWORD:?APP_DB_PASSWORD is required}
+
+  # Discrete parts, for the same reason the database connection is discrete:
+  # a password is an arbitrary byte string, and '/', '#', '?' and '%' are all
+  # STRUCTURAL in a URI. Interpolating one into `redis://default:...@host:port`
+  # made a legitimate strong password an unparseable URL — measured, not
+  # assumed. See src/lib/redis-connection.ts.
+  REDIS_HOST: redis-prod
+  REDIS_PORT: '6379'
+  REDIS_USERNAME: default
+  REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+
+  PAYLOAD_SECRET: ${PAYLOAD_SECRET:?PAYLOAD_SECRET is required}
+  # Schema push is never permitted in production; the config throws if it is
+  # ever set true here.
+  PAYLOAD_DB_PUSH: 'false'
+
+  # Source-free production migrations, applied by Payload during `db.connect()`
+  # from the migration list compiled into this image.
+  PAYLOAD_RUNTIME_MIGRATIONS: 'true'
+  # Create-missing canonical system Roles + create-if-absent / validate-only
+  # Super Admin. NOT the broad Seed.
+  PAYLOAD_RUNTIME_BOOTSTRAP: 'true'
+  # The broad canonical Seed never runs from application startup, in either
+  # environment. It is a separate one-shot operation.
+  PAYLOAD_SEED_ENABLED: 'false'
+
+  INITIAL_ADMIN_EMAIL: ${INITIAL_ADMIN_EMAIL:?INITIAL_ADMIN_EMAIL is required}
+  # Required only until the configured Super Admin exists. Removing it from the
+  # env file does NOT remove it from an already-created container — the
+  # container must be recreated. See "Retiring the bootstrap password" in
+  # deploy/README.md.
+  INITIAL_ADMIN_PASSWORD: ${INITIAL_ADMIN_PASSWORD:-}
+
+  # Local persistent uploads on this single VPS. S3 stays available in the
+  # codebase as an optional future backend but is off here.
+  S3_ENABLED: 'false'
+  PAYLOAD_UPLOADS_DIR: /app/uploads
+
+  RATE_LIMIT_WINDOW_SECONDS: ${RATE_LIMIT_WINDOW_SECONDS:-900}
+  RATE_LIMIT_MAX_REQUESTS: ${RATE_LIMIT_MAX_REQUESTS:-5}
+
+x-app-healthcheck: &app-healthcheck
+  # /api/health initializes Payload, performs a real PostgreSQL read, and
+  # reports 503 if the identity bootstrap failed — so it cannot report healthy
+  # until migrations and identity bootstrap have both succeeded.
+  test:
+    - CMD
+    - node
+    - -e
+    - "fetch('http://127.0.0.1:3000/api/health').then((r)=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+  interval: 10s
+  timeout: 5s
+  # start_period is sized from measured fresh-database migration time (see
+  # deploy/README.md). Re-measure when a release adds a long or locking
+  # migration; that is also the signal to reconsider a separate source-free
+  # migration runner for that release.
+  start_period: 120s
+  retries: 30
+
+services:
+  postgres-prod:
+    # Digest-pinned; Dependabot (see .github/dependabot.yml) keeps it current.
+    image: postgres:18.6-bookworm@sha256:7d2695c3aa88e792e8b3b233e7e4adb296a20412c6c0ca361e3edaaacfada108
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      # This is the cluster bootstrap/administration role. The official image
+      # creates POSTGRES_USER as a server superuser, so it is deliberately NOT
+      # the credential the long-lived application uses.
+      POSTGRES_USER: ${POSTGRES_ADMIN_USER:-aau_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?POSTGRES_ADMIN_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      # Consumed by the first-init script below to provision the non-superuser
+      # application role that Payload actually connects with.
+      APP_DB_USER: ${APP_DB_USER:?APP_DB_USER is required}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?APP_DB_PASSWORD is required}
+    healthcheck:
+      test:
+        ['CMD-SHELL', 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      # PostgreSQL 18+ moved PGDATA to a version-specific path under
+      # /var/lib/postgresql, so that directory — not /var/lib/postgresql/data —
+      # is the correct volume target for this image generation.
+      - postgres-prod-data:/var/lib/postgresql
+      # Official first-init hook: runs only while the data directory is empty.
+      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
+    # No `ports:` — see the `networks:` note at the foot of this file for what
+    # `internal: true` does and, importantly, does NOT guarantee.
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: ${POSTGRES_MEM_LIMIT:-1024m}
+    pids_limit: ${POSTGRES_PIDS_LIMIT:-512}
+
+  redis-prod:
+    image: redis:8.8.2-trixie@sha256:2b42a93631132be6df7a31f843b91ea8a907011e955b03395b7edbb13a20a99d
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+      # redis-cli reads its password from this variable, so the healthcheck
+      # authenticates without putting the secret on a command line.
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    # ── Why the config file is written at start rather than passed as a flag ──
+    # `redis-server --requirepass <secret>` puts the password in the process's
+    # argv, and /proc/<pid>/cmdline is world-readable on Linux. On a host that
+    # also serves other cPanel accounts that is a real disclosure. Writing the
+    # directive into a private file inside the container instead means the
+    # secret appears only in the container's environment, which the kernel
+    # restricts to the same UID and root.
+    #
+    # Redis is also on an internal network with no published port. This is
+    # defence in depth, not a replacement for that: `internal: true` does not
+    # isolate the container from the Docker HOST, and an unauthenticated Redis
+    # reachable from the host is a well-known escalation path.
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        umask 077
+        conf=/tmp/redis.conf
+        : > "$$conf"
+        printf 'appendonly yes\n' >> "$$conf"
+        # redis.conf is whitespace-separated and treats an unquoted `#` as a
+        # comment, so a strong password containing a space or `#` produces
+        # "FATAL CONFIG FILE ERROR ... wrong number of arguments" (measured).
+        # Redis's own double-quoted string form is the fix; inside it only `"`
+        # and `\` need escaping.
+        escaped=$$(printf '%s' "$$REDIS_PASSWORD" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+        printf 'requirepass "%s"\n' "$$escaped" >> "$$conf"
+        exec redis-server "$$conf"
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - redis-prod-data:/data
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: ${REDIS_MEM_LIMIT:-256m}
+    pids_limit: ${REDIS_PIDS_LIMIT:-128}
+
+  # ── The stable service ────────────────────────────────────────────────────
+  # Bound to the loopback port the reverse proxy forwards to. It is replaced
+  # only AFTER a candidate on the private port has passed its health gate.
+  app-prod:
+    <<: *app-image
+    restart: unless-stopped
+    logging: *logging
+    init: true
+    # Measured from the fresh-database migration run, not guessed. Give Node
+    # room to finish in-flight requests on a controlled cutover.
+    stop_grace_period: 30s
+    ports:
+      # Loopback only. cPanel-managed Apache terminates TLS on :443 and proxies
+      # here; this port is never publicly bound. A host/provider firewall (CSF
+      # on the real host) must still be configured — a Docker binding is not a
+      # firewall.
+      - '127.0.0.1:${APP_HOST_PORT:-3000}:3000'
+    environment: *app-environment
+    volumes:
+      # Explicit host path: easy to locate, and directly reachable by host
+      # backup tooling. `deploy/scripts/backup.sh` reads this path.
+      - ${UPLOADS_HOST_PATH:-/srv/aau/production/uploads}:/app/uploads
+    networks:
+      # `backend` reaches PostgreSQL/Redis; `frontend` carries the loopback
+      # port publish. The app is the only service on both, so it is the only
+      # path between the data services and anything outside.
+      - backend
+      - frontend
+    depends_on:
+      postgres-prod:
+        condition: service_healthy
+      redis-prod:
+        condition: service_healthy
+    healthcheck: *app-healthcheck
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      # The app listens on 3000 as a non-root user and needs no capabilities.
+      # `read_only: true` is deliberately NOT set: Next writes image-optimizer
+      # cache and temp files, and Payload writes local uploads.
+      - ALL
+    mem_limit: ${APP_MEM_LIMIT:-1280m}
+    pids_limit: ${APP_PIDS_LIMIT:-512}
+
+  # ── The candidate ─────────────────────────────────────────────────────────
+  # Identical to app-prod except for the host port it publishes. deploy.sh
+  # starts a new release HERE first, so migrations and the identity bootstrap
+  # run and are health-gated on a port no reverse proxy forwards to. Only a
+  # candidate that passes is promoted onto the stable port.
+  #
+  # Behind a `candidate` profile so it never starts as part of an ordinary
+  # `compose up`, and is not part of the steady-state stack.
+  app-candidate:
+    <<: *app-image
+    profiles: ['candidate']
+    # `no`, not `unless-stopped`: a failed candidate must NOT crash-loop while
+    # deploy.sh is deciding how to recover, and must not survive a host reboot.
+    restart: 'no'
+    logging: *logging
+    init: true
+    stop_grace_period: 30s
+    ports:
+      - '127.0.0.1:${CANDIDATE_HOST_PORT:-3001}:3000'
+    environment: *app-environment
+    volumes:
+      - ${UPLOADS_HOST_PATH:-/srv/aau/production/uploads}:/app/uploads
+    networks:
+      - backend
+      - frontend
+    depends_on:
+      postgres-prod:
+        condition: service_healthy
+      redis-prod:
+        condition: service_healthy
+    healthcheck: *app-healthcheck
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: ${APP_MEM_LIMIT:-1280m}
+    pids_limit: ${APP_PIDS_LIMIT:-512}
+
+# ── Resource policy ───────────────────────────────────────────────────────
+# These defaults are deliberately NOT unlimited, which is what `0` and `-1`
+# meant here before.
+#
+# This deployment shares one host with the university's cPanel installation:
+# Apache serving other sites, MariaDB, mail, CSF — on ~11 GiB of RAM with **no
+# swap configured**. With unlimited container memory, a runaway build or a leak
+# in this application does not fail locally; the kernel OOM killer picks a
+# victim by score across the WHOLE host, and MariaDB or Apache are entirely
+# plausible choices. The blast radius of an unbounded container here is every
+# other site on the server.
+#
+# Bounded limits make that failure local: the offending container is killed and
+# restarted by its own restart policy, and nothing outside this stack notices.
+#
+# These numbers are CONSERVATIVE, UNVALIDATED CEILINGS, not measured production
+# sizing. Their only job right now is to make an unbounded container impossible
+# so a leak stays local; they are not claimed to be the right production values,
+# because this repository cannot measure the real host. The final production
+# limits must be DERIVED from representative RSS/PIDs/CPU measured on the real
+# host under load (the host has no swap) before PRODUCTION_VPS_READY=true — do
+# not promote these guesses to "validated" by editing a document.
+#
+# Temporary ceiling (per environment; staging overrides them lower in
+# deploy/.env.staging.example):
+#
+#   app-prod        1280m   ) app-candidate runs CONCURRENTLY during a cutover,
+#   app-candidate   1280m   ) so peak is both, not one
+#   postgres-prod   1024m
+#   redis-prod       256m
+#   ------------------------------------------------------------------
+#   steady          2560m    peak (during a deploy)  3840m
+#
+# With staging's smaller budget the two environments peak together at well under
+# 6 GiB, leaving the host's own services the rest. Re-check every number against
+# `free -m` and real load on the host before production.
+
+networks:
+  # `internal: true` removes the default gateway from this network. What that
+  # DOES mean: containers on it get no ordinary route to anything outside it,
+  # and nothing outside the Docker network stack routes in.
+  #
+  # What it does NOT mean, and must not be claimed: it does not isolate these
+  # services from the Docker HOST. The host owns the bridge and can reach
+  # container IPs directly; anything running as root on the host can reach them
+  # regardless. The host is a privileged trust boundary, not something Docker
+  # networking defends against — which is why Redis and PostgreSQL both require
+  # authentication even here.
+  #
+  # Public exposure is a host/provider firewall question (CSF on the real host)
+  # and must be validated there, not inferred from this file.
+  backend:
+    internal: true
+  frontend:
+
+volumes:
+  postgres-prod-data:
+  redis-prod-data:

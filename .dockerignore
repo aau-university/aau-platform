@@ -1,0 +1,53 @@
+# Version control and local secrets
+.git
+.gitignore
+.gitattributes
+.agents
+.env
+.env.*
+!.env.docker.example
+
+# Key material must never enter a build context: anything here is readable in
+# the build cache and in any stage that runs `COPY . .`.
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+id_rsa*
+*.jks
+
+# Dependencies and build/test output — rebuilt inside the image
+node_modules
+.pnpm-store
+.next
+out
+coverage
+test-results
+playwright-report
+uploads
+media
+*.log
+
+# Editor / assistant / tooling metadata. None of it is read by any build or
+# operations stage; excluding it keeps the build context (and therefore the
+# cache key) stable across unrelated edits.
+.vscode
+.claude
+.gemini
+.codegraph
+.coderabbit.yaml
+.mcp.json
+opencode.json
+skills-lock.json
+
+# CI definitions are consumed by GitHub, never by a build stage.
+.github
+
+# Planning/documentation trees and root-level agent/readme documents never
+# belong in a build context. `src/**/README.md` files stay in the context.
+# `docs` and `plans` are kept as a guard in case such trees are ever re-added.
+docs
+plans
+AGENTS.md
+README.md

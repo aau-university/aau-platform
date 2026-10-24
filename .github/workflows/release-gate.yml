@@ -1,0 +1,539 @@
+name: PR release gate
+
+on:
+  pull_request:
+    branches: [develop]
+  workflow_dispatch:
+  # Reusable so the production deployment workflow can validate the EXACT SHA
+  # it is about to ship. A green check on a PR head is not proof for a
+  # different merge commit.
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Exact ref or SHA to validate'
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-gate-${{ inputs.ref || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: 24.19.0
+  PNPM_VERSION: 10.34.4
+  PAYLOAD_SECRET: ci-payload-secret-at-least-32-characters-long
+  PAYLOAD_DB_PUSH: 'false'
+  S3_ENABLED: 'false'
+  PAYLOAD_SERVER_ORIGIN: http://127.0.0.1:3000
+  NEXT_PUBLIC_SERVER_URL: http://127.0.0.1:3000
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check:payload-versions
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm test:unit
+
+      # Host-script drills that need no Docker: real concurrent processes
+      # racing the real operation lock, and the env-file parsing contract the
+      # whole secrets design rests on.
+      - name: Operation-lock concurrency drill
+        run: bash tests/deploy/operation-lock-drill.sh
+      - name: Env-file contract drill
+        run: bash tests/deploy/env-contract-drill.sh
+      - name: Compose image-override acknowledgement drill
+        run: bash tests/deploy/compose-override-drill.sh
+      # The fail-closed surface of the one-time data initialization. Every
+      # refusal it covers fires BEFORE the script starts a container, which is
+      # both the property under test and the reason it belongs here rather than
+      # in the Docker simulation. The situations that need a real database are
+      # Phase 7 of tests/docker/first-install-and-recovery-drill.sh.
+      - name: First-install initialization fail-closed drill
+        run: bash tests/deploy/initialize-guard-drill.sh
+      - name: Writer-freeze fail-closed / bounded-retry drill
+        # Proves the shared writers_freeze contract with a docker stub: a failed
+        # state enumeration fails CLOSED, a transient `removing` one-off is
+        # waited out, and a permanently active writer fails the freeze. No real
+        # stack, so it belongs with the other no-Docker host-script drills.
+        run: bash tests/deploy/writers-freeze-drill.sh
+      # The Neon -> VPS migration tooling's fail-closed contract: the
+      # staging-only guard, the export integrity envelope, the Public Media
+      # scope (Private Media binaries stay out), and an unmeasurable value
+      # never reading as a match. No Docker, so it belongs here with the other
+      # host-script drills.
+      - name: Neon migration fail-closed drill
+        run: bash tests/migration/neon-migration-contract-drill.sh
+
+      # Fault injection for the one window in the import where staging can be
+      # left without its application database: the moment between the two
+      # promotion renames. Drives the real state machine with a rename that
+      # fails on demand.
+      - name: Neon promotion fault-injection drill
+        run: bash tests/migration/neon-promotion-drill.sh
+
+      # Regression for the failure the first real Staging rehearsal hit: the
+      # Neon archive contains `CREATE SCHEMA public`, and a freshly created
+      # scratch database already has one, so `pg_restore --exit-on-error` died
+      # on "schema already exists". Runs against a REAL server (the runner's
+      # PostgreSQL, else the pinned 18.6 image) because every part of that bug
+      # is server behaviour a source-text assertion would sail past.
+      - name: Neon scratch-restore regression drill
+        run: bash tests/migration/neon-scratch-restore-drill.sh
+
+      # Regression for the defect the 2026-09-14 live Staging diagnosis found:
+      # the schema upgrade ran over the ADMIN connection, so every object it
+      # created was owned by aau_admin while the application connects as
+      # aau_app — and Payload's Admin died with SQLSTATE 42501 on version
+      # tables that every schema count said were present and correct. Real
+      # server, and mutation-checked: the old execution model must still
+      # reproduce `permission denied`.
+      - name: Neon object-ownership regression drill
+        run: bash tests/migration/neon-object-ownership-drill.sh
+
+      - name: Security-gate semantics drills
+        # These prove the release gate's own failure paths. Both scanners
+        # previously reported success while the condition they guard was
+        # violated, so the gates themselves are now regression-tested.
+        run: |
+          bash tests/security/trivy-scan-gate-drill.sh
+          bash tests/security/image-secret-scan-drill.sh
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:int
+      - run: pnpm test:seed
+
+  generated-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm verify:generated
+      - name: Verify migration drift
+        shell: bash
+        env:
+          S3_ENABLED: 'true'
+          S3_BUCKET: schema-contract
+          S3_ENDPOINT: http://127.0.0.1:9000
+          S3_REGION: auto
+          S3_ACCESS_KEY_ID: schema-contract
+          S3_SECRET_ACCESS_KEY: schema-contract-secret
+        run: |
+          pnpm payload migrate:create ci_drift --skip-empty
+          test -z "$(git status --porcelain -- src/migrations)"
+      - run: pnpm build
+
+  browser:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18.6-bookworm
+        env:
+          POSTGRES_DB: aau_fixes_e2e
+          POSTGRES_PASSWORD: payload
+          POSTGRES_USER: payload
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U payload -d aau_fixes_e2e"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:8.8.2-trixie
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      DATABASE_URI: postgresql://payload:payload@127.0.0.1:5432/aau_fixes_e2e
+      DATABASE_DIRECT_URI: postgresql://payload:payload@127.0.0.1:5432/aau_fixes_e2e
+      REDIS_URL: redis://127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm migrate
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm test:e2e
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: playwright-report-${{ github.sha }}
+          path: |
+            playwright-report
+            test-results
+          if-no-files-found: ignore
+
+  docker:
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URI: postgresql://payload:payload@postgres-prod:5432/aau_platform
+      DATABASE_DIRECT_URI: postgresql://payload:payload@postgres-prod:5432/aau_platform
+      POSTGRES_PASSWORD: payload
+      # This CI stack is served over loopback HTTP; the production runtime
+      # otherwise requires a real public HTTPS origin. The VPS profile never
+      # sets this, which `vps-deployment-contract.test.ts` asserts.
+      PAYLOAD_ALLOW_INSECURE_ORIGIN: 'true'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+      - name: Build development image
+        run: docker build --target dev -t aau-payload-platform:dev .
+      - name: Build production and execute explicit first-install bootstrap
+        env:
+          INITIAL_ADMIN_EMAIL: admin@example.test
+          INITIAL_ADMIN_PASSWORD: CI-Initial-Admin-Password-2026!
+        run: |
+          project=aau-pr25-${{ github.run_id }}
+          docker compose -f docker-compose.prod.yml -p "$project" build
+          docker compose -f docker-compose.prod.yml -p "$project" up --detach --wait postgres-prod redis-prod
+          docker compose -f docker-compose.prod.yml -p "$project" run --rm migrate-prod
+          docker compose -f docker-compose.prod.yml -p "$project" --profile canonical-seed run --rm --no-deps canonical-seed-source-build
+          docker compose -f docker-compose.prod.yml -p "$project" up --detach --no-deps --wait app-prod
+      - name: Verify public and health endpoints
+        run: |
+          curl --fail --show-error http://127.0.0.1:3000/api/health
+          curl --fail --show-error http://127.0.0.1:3000/
+      - name: Verify explicit bootstrap idempotency and version stability
+        env:
+          INITIAL_ADMIN_EMAIL: admin@example.test
+          INITIAL_ADMIN_PASSWORD: CI-Initial-Admin-Password-2026!
+        run: |
+          project=aau-pr25-${{ github.run_id }}
+          compose=(docker compose -f docker-compose.prod.yml -p "$project")
+          snapshot_version_counts() {
+            "${compose[@]}" exec -T postgres-prod psql -U payload -d aau_platform -At <<'SQL'
+          SELECT format('SELECT %L || ''='' || count(*) FROM %I;', tablename, tablename)
+          FROM pg_tables
+          WHERE schemaname = 'public' AND tablename ~ '^_.*_v$'
+          ORDER BY tablename
+          \gexec
+          SQL
+          }
+          versions_before=$(snapshot_version_counts)
+          "${compose[@]}" --profile canonical-seed run --rm --no-deps canonical-seed-source-build | tee seed-second-run.log
+          versions_after=$(snapshot_version_counts)
+          test "$versions_after" = "$versions_before"
+          node scripts/assert-seed-summary.mjs seed-second-run.log
+      - name: Verify normal redeploy preserves dynamic Role state
+        run: |
+          project=aau-pr25-${{ github.run_id }}
+          compose=(docker compose -f docker-compose.prod.yml -p "$project")
+          snapshot_core_counts() {
+            "${compose[@]}" exec -T postgres-prod psql -U payload -d aau_platform -Atc "SELECT concat_ws('|', (SELECT count(*) FROM users), (SELECT count(*) FROM roles), (SELECT count(*) FROM colleges), (SELECT count(*) FROM academic_programs), (SELECT count(*) FROM study_plans), (SELECT count(*) FROM pages));"
+          }
+          snapshot_version_counts() {
+            "${compose[@]}" exec -T postgres-prod psql -U payload -d aau_platform -At <<'SQL'
+          SELECT format('SELECT %L || ''='' || count(*) FROM %I;', tablename, tablename)
+          FROM pg_tables
+          WHERE schemaname = 'public' AND tablename ~ '^_.*_v$'
+          ORDER BY tablename
+          \gexec
+          SQL
+          }
+          "${compose[@]}" run --rm --no-deps -e VERIFY_NORMAL_DEPLOY_ROLE_STATE=true migrate-prod pnpm payload run ./scripts/verify-normal-deploy-role-state.ts
+          expected=$("${compose[@]}" exec -T postgres-prod psql -U payload -d aau_platform -Atc "select can_access_refine from roles where slug = 'coordinator'")
+          core_before=$(snapshot_core_counts)
+          versions_before=$(snapshot_version_counts)
+          seed_logs_before=$("${compose[@]}" logs --no-color app-prod | grep -c 'Seed completed' || true)
+          "${compose[@]}" run --rm migrate-prod
+          "${compose[@]}" up --detach --no-deps --force-recreate --wait app-prod
+          actual=$("${compose[@]}" exec -T postgres-prod psql -U payload -d aau_platform -Atc "select can_access_refine from roles where slug = 'coordinator'")
+          core_after=$(snapshot_core_counts)
+          versions_after=$(snapshot_version_counts)
+          seed_logs_after=$("${compose[@]}" logs --no-color app-prod | grep -c 'Seed completed' || true)
+          test "$actual" = "$expected"
+          test "$core_after" = "$core_before"
+          test "$versions_after" = "$versions_before"
+          test "$seed_logs_before" = "0"
+          test "$seed_logs_after" = "0"
+      - name: Capture Docker logs
+        if: always()
+        run: docker compose -f docker-compose.prod.yml -p aau-pr25-${{ github.run_id }} logs --no-color > docker-cold-start.log
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: docker-cold-start-${{ github.sha }}
+          path: docker-cold-start.log
+          if-no-files-found: error
+      - name: Stop cold-start stack
+        if: always()
+        run: docker compose -f docker-compose.prod.yml -p aau-pr25-${{ github.run_id }} down --volumes --remove-orphans
+
+  # Proves the source-free production runtime contract against the EXACT
+  # final runner image: no repository source is mounted, Payload applies its
+  # own migrations, and the identity bootstrap is create-missing-only.
+  runner-production-simulation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+
+      # The commit that was ACTUALLY checked out, not `github.sha`. On a
+      # pull_request event `github.sha` is the synthetic merge commit, which is
+      # NOT what any job here checks out (they check out the head sha), so an
+      # image labelled with `github.sha` would claim a provenance that never
+      # built it. `git rev-parse HEAD` is the one value that is correct for
+      # every trigger — PR, workflow_dispatch, and workflow_call with a ref.
+      - name: Resolve the checked-out revision
+        id: rev
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Built with the runner's default Docker builder, exactly like the
+      # `docker` job above. `next/font/google` fetches fonts during the build,
+      # and the buildx `docker-container` driver does not reliably give the
+      # build that outbound access — `build-push-action` failed here with
+      # `Can't resolve '@vercel/turbopack-next/internal/font/google/font'`
+      # while the identical target built fine with the default builder.
+      - name: Build the exact runner image
+        run: |
+          # A real public HTTPS origin, so the image exercises the production
+          # origin / CORS / secure-cookie path rather than a localhost fallback.
+          docker build --target runner -t aau-runner:ci \
+            --build-arg NEXT_PUBLIC_SERVER_URL=https://aau-vps.simulation.test \
+            --build-arg IMAGE_REVISION="${{ steps.rev.outputs.sha }}" \
+            --build-arg IMAGE_SOURCE="${{ github.server_url }}/${{ github.repository }}" \
+            .
+
+      # The image's recorded revision must be EXACTLY the commit that built it.
+      # restore.sh and backup.sh read this label to pair a database with the
+      # application build it belongs to; a wrong label pairs a restore with the
+      # wrong code.
+      - name: Assert the image revision matches the checked-out commit
+        run: |
+          expected="$(git rev-parse HEAD)"
+          actual="$(docker image inspect --format \
+            '{{index .Config.Labels "org.opencontainers.image.revision"}}' aau-runner:ci)"
+          echo "expected=${expected} actual=${actual}"
+          test "$actual" = "$expected"
+
+      - name: Assert the runner image is source-free and migration-complete
+        run: bash scripts/assert-runner-image.sh aau-runner:ci
+
+      - name: Fresh / restart / upgrade / failure / persistence simulation
+        run: bash tests/docker/production-simulation.sh aau-runner:ci
+
+      - name: Reverse-proxy production simulation
+        run: bash tests/docker/reverse-proxy-simulation.sh aau-runner:ci
+
+      - name: Backup and restore drill
+        run: bash tests/docker/backup-restore-drill.sh aau-runner:ci
+
+      # Drives the real deploy/backup/restore scripts from an empty host:
+      # first install, redeploy backup gate, compatibility metadata, corrupt
+      # archive rejection, migration-aware rollback, metadata-driven restore.
+      - name: First-install and recovery drill
+        run: bash tests/docker/first-install-and-recovery-drill.sh aau-runner:ci
+
+      # Fail-closed dirty-DB detection, backup-failure service recovery (no
+      # outage), and snapshot-reproducing uploads restore — all against the
+      # real deploy/backup/restore scripts. Uses a size-capped tmpfs to force a
+      # deterministic disk-full backup failure (sudo is passwordless on the
+      # hosted runner).
+      - name: Deploy-safety drill
+        run: bash tests/docker/deploy-safety-drill.sh aau-runner:ci
+
+      # Keeps a reverse proxy polling the stable port for the WHOLE candidate
+      # replacement, including a candidate that binds its port and answers 500 —
+      # what a Next.js process looks like between "listening" and "Payload has
+      # migrated". A simulation that starts the proxy only after health passes
+      # cannot observe the leak it is meant to rule out.
+      - name: Cutover traffic-gating drill
+        run: bash tests/docker/cutover-gating-drill.sh aau-runner:ci
+
+      # Environment isolation: production and staging share a host and must
+      # share nothing else.
+      - name: Environment isolation drill
+        run: bash tests/deploy/environment-isolation-drill.sh
+
+      # The explicit one-shot Seed, run from the source-free bundled artifact
+      # inside the real runner image.
+      - name: One-shot source-free Seed drill
+        run: bash tests/docker/seed-one-shot-drill.sh aau-runner:ci
+
+      # Fault injection for the three failure windows that previously had no
+      # test at all, and in two cases no implementation either.
+      - name: Redis credential drill
+        # Several drills already used a deliberately hostile Redis password and
+        # all of them passed -- because none of them ever opened a Redis
+        # connection. This one makes the connection the assertion.
+        run: bash tests/docker/redis-credential-drill.sh aau-runner:ci
+
+      - name: Restore guard drill
+        # Cross-environment restore, and the write freeze covering every writer
+        # rather than app-prod alone.
+        run: bash tests/docker/restore-guard-drill.sh aau-runner:ci
+
+      - name: Promotion-failure drill
+        # Failure after the candidate is healthy but before the stable port
+        # serves -- injected by squatting that port.
+        run: bash tests/docker/promotion-failure-drill.sh aau-runner:ci
+
+  # ── Vulnerability and secret gates ──────────────────────────────────────
+  # Deliberately three focused checks, not a pile of noisy scanners:
+  #
+  #   1. the npm dependency tree, because that is what ships in the runner;
+  #   2. the FINAL RUNNABLE IMAGE plus the pinned PostgreSQL and Redis images,
+  #      because digest-pinning a base image freezes its CVEs as well as its
+  #      behaviour — pinning without scanning is how a base image quietly rots;
+  #   3. secret material in the repository and in the image's layer history.
+  #
+  # Scanners run against the exact artifacts, from a digest-pinned Trivy image
+  # rather than a third-party action, so the scanner itself is pinned the same
+  # way everything else here is.
+  security:
+    runs-on: ubuntu-latest
+    env:
+      # Trivy 0.74.0. Pinned by digest for the same reason every other image
+      # here is: a tag can be repointed.
+      TRIVY: aquasec/trivy@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      # See the identically named step in runner-production-simulation: the
+      # image must be labelled with the commit that built it, never the
+      # synthetic PR merge sha.
+      - name: Resolve the checked-out revision
+        id: rev
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Dependency vulnerabilities
+        # Compared against a recorded baseline, not run bare. A plain
+        # `pnpm audit --audit-level=high` was red on its FIRST run: the tree
+        # already carried 24 high/critical advisories, nearly all transitive
+        # through Payload and Next. A gate that is red on day one for reasons
+        # nobody in the current change can fix is not a gate — it is a step
+        # people learn to skip, and then a genuinely new vulnerability slips
+        # past unnoticed. Lowering the threshold would hide the debt instead.
+        #
+        # So this fails on anything NOT in the baseline, and also fails when a
+        # baselined advisory disappears, so the baseline cannot rot into a
+        # permanent exemption list. See scripts/check-dependency-audit.mjs.
+        run: pnpm audit:dependencies
+
+      - name: Build the exact runner image
+        run: |
+          docker build --target runner -t aau-runner:scan \
+            --build-arg NEXT_PUBLIC_SERVER_URL=https://aau-vps.simulation.test \
+            --build-arg IMAGE_REVISION="${{ steps.rev.outputs.sha }}" .
+
+      - name: Scan the final runnable image and the pinned data images
+        # The helper lives in scripts/trivy-image-scan.sh, not inline here, and
+        # tests/security/trivy-scan-gate-drill.sh proves it propagates the
+        # scanner's exit status. The previous inline version printed
+        # HIGH/CRITICAL findings and exited 0: `set -e` is suspended inside a
+        # function called as the left operand of `||`, and the trailing
+        # `echo "::endgroup::"` overwrote the return status anyway.
+        run: ./scripts/trivy-image-scan.sh aau-runner:scan deploy/docker-compose.vps.yml
+
+      - name: Secret material in the repository and in the image history
+        run: |
+          docker run --rm -v "$PWD:/src" "$TRIVY" fs \
+            --scanners secret --exit-code 1 --format table /src
+
+          # Build args and ENV are readable in image history; a secret that
+          # reached a layer is disclosed to anyone who can pull the image.
+          # The check evaluates every occurrence independently -- see
+          # scripts/assert-no-image-secrets.sh for why a whole-image exemption
+          # was a false negative.
+          ./scripts/assert-no-image-secrets.sh aau-runner:scan
+
+      # ── SBOM ─────────────────────────────────────────────────────────────
+      # Generated as a BUILD ARTIFACT, not attached to the image.
+      #
+      # `sbom: true` on the push would make buildx emit an OCI image index
+      # instead of a plain manifest, changing the digest shape every consumer
+      # sees — including the root-owned entrypoint on the VPS, which pins a
+      # single manifest digest. Release identity is the thing this deployment is
+      # built around; it does not get changed to gain an inventory file.
+      - name: Generate an SBOM for the exact runner image
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${PWD}:/out" \
+            "$TRIVY" image --format cyclonedx --output /out/sbom.cdx.json aau-runner:scan
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom.cdx.json
+          if-no-files-found: error
+
+
+  release-gate:
+    if: always()
+    needs: [quality, integration, generated-and-build, browser, docker, runner-production-simulation, security]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every release job
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS"
+          test "${{ needs.quality.result }}" = success
+          test "${{ needs.integration.result }}" = success
+          test "${{ needs.generated-and-build.result }}" = success
+          test "${{ needs.browser.result }}" = success
+          test "${{ needs.docker.result }}" = success
+          test "${{ needs.runner-production-simulation.result }}" = success
+          test "${{ needs.security.result }}" = success

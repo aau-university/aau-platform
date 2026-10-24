@@ -1,0 +1,342 @@
+name: Build and publish runner image
+
+# Builds the EXACT production or staging runner image for a specific SHA,
+# asserts it is a source-free artifact, and publishes it to private GHCR with an
+# immutable digest identity.
+#
+# ── This workflow cannot publish on its own ───────────────────────────────
+# `workflow_dispatch` here is BUILD-ONLY. There is no manual publish input.
+#
+# Production authorization used to live entirely in the deployment workflow,
+# which made it bypassable: anyone who could dispatch this workflow could set
+# `publish: true` with the real production origin and push an artifact that the
+# VPS would then accept as a production release. Authorization has to be a
+# property of the ONLY path that can publish, so publishing is reachable only
+# through `workflow_call` from release-production.yml or deploy-staging.yml,
+# each of which gates on its own Environment and release lineage first.
+#
+# `deploy-production.yml` deliberately does NOT call this workflow. It deploys
+# an already-published digest and never builds, so the artifact that was gated
+# and authorized is byte-for-byte the artifact that runs.
+#
+# ── Channels are separate packages, not separate tags ─────────────────────
+# A staging image is built for the staging origin from a laxer release lineage.
+# If it lived in the same GHCR package as production, "existing in the registry"
+# would be indistinguishable from "approved for production", and only a tag —
+# mutable by definition — would separate them. So each channel publishes to its
+# own package, and the root-owned entrypoint on the VPS accepts only its own.
+
+on:
+  workflow_dispatch:
+    inputs:
+      server_url:
+        description: >-
+          Public HTTPS origin to build against. Optional; defaults to a
+          validation origin. This workflow NEVER publishes when dispatched
+          manually — publication is only reachable from release-production.yml
+          and deploy-staging.yml.
+        type: string
+        required: false
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Exact ref or SHA to build'
+        type: string
+        required: true
+      publish:
+        type: boolean
+        default: false
+      channel:
+        description: 'production | staging — selects the GHCR package'
+        type: string
+        required: true
+      server_url:
+        description: 'Public HTTPS origin baked into the image'
+        type: string
+        required: true
+    outputs:
+      image:
+        description: 'Immutable image reference (name@sha256:digest)'
+        value: ${{ jobs.build.outputs.image }}
+      digest:
+        value: ${{ jobs.build.outputs.digest }}
+
+permissions:
+  contents: read
+
+# NOTE (supply chain): every third-party action below is pinned to a
+# full-length commit SHA — GitHub's guidance for an immutable action reference,
+# since a tag can be repointed at new code. The trailing `# v4`-style comment
+# records which release each SHA was resolved from; Dependabot updates both
+# together. Enforced by src/__tests__/config/vps-deployment-contract.test.ts.
+
+concurrency:
+  group: build-publish-${{ inputs.channel || 'validation' }}-${{ inputs.ref || github.ref }}
+  cancel-in-progress: false
+
+env:
+  # NEXT_PUBLIC_* values are inlined by `next build`, so the public origin is a
+  # BUILD argument, not a runtime variable. A validation image built for a
+  # non-production origin must never be deployed anywhere real.
+  DEFAULT_SERVER_URL: https://aau-validation.invalid
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required to push to ghcr.io/<owner>/<repo>. GITHUB_TOKEN is sufficient
+      # for a repository-owned package; no personal access token is needed.
+      packages: write
+      # Sigstore OIDC + attestation storage for build provenance.
+      id-token: write
+      attestations: write
+    outputs:
+      image: ${{ steps.identity.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Refuse a manual publish attempt
+        # Defence in depth against a future edit that reintroduces a `publish`
+        # dispatch input. `github.event_name` is not settable by a caller.
+        #
+        # A reusable workflow inherits its CALLER's `github` context, so a
+        # legitimate gated call from release-production.yml (itself started by
+        # workflow_dispatch) also sees event_name == 'workflow_dispatch'. What
+        # tells the two apart is workflow identity: `github.workflow_ref` names
+        # the top-level workflow, `job.workflow_ref` the file containing this
+        # job. They are equal only when this file IS the top-level workflow,
+        # i.e. dispatched directly. An empty `job.workflow_ref` (identity
+        # unavailable) is treated as a direct dispatch — fail closed.
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          inputs.publish &&
+          (job.workflow_ref == '' || github.workflow_ref == job.workflow_ref)
+        run: |
+          echo "::error::this workflow does not publish when dispatched manually." >&2
+          echo "::error::Publication is reachable only from release-production.yml / deploy-staging.yml," >&2
+          echo "::error::which gate on their Environment and release lineage first." >&2
+          exit 1
+
+      - name: Resolve exact SHA
+        id: target
+        run: |
+          echo "ref=${{ inputs.ref || github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.target.outputs.ref }}
+
+      - name: Record the exact SHA being built
+        id: sha
+        run: |
+          sha="$(git rev-parse HEAD)"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Building exact SHA ${sha}"
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          # `next/font/google` fetches fonts during `next build`. The default
+          # `docker-container` driver does not reliably provide that outbound
+          # access, which fails the build with an unresolvable
+          # `@vercel/turbopack-next/internal/font/google/font` module.
+          driver-opts: network=host
+
+      - name: Log in to GHCR
+        if: inputs.publish
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Artifact identity ────────────────────────────────────────────────
+      # `NEXT_PUBLIC_SERVER_URL` is inlined at build time, so two images built
+      # from the SAME git SHA with different origins are NOT interchangeable —
+      # one serves the university domain, another serves staging, another a
+      # validation origin. Tagging them by SHA alone would make them
+      # indistinguishable in the registry.
+      #
+      # The origin's SHAPE is validated inside the Docker build itself, by the
+      # same `normalizePublicOrigin` the application runtime uses, so CI and the
+      # application cannot disagree about what a valid origin is. What is
+      # checked HERE is the separate publication POLICY: which origins are
+      # allowed to become a published artifact of which channel.
+      - name: Enforce channel and origin publication policy
+        id: origin
+        env:
+          SERVER_URL: ${{ inputs.server_url || env.DEFAULT_SERVER_URL }}
+          PUBLISH: ${{ inputs.publish == true }}
+          CHANNEL: ${{ inputs.channel || 'validation' }}
+        run: |
+          if [ "$PUBLISH" != "true" ]; then
+            echo "prefix=validation-" >> "$GITHUB_OUTPUT"
+            echo "suffix=" >> "$GITHUB_OUTPUT"
+            echo "Building a VALIDATION artifact for ${SERVER_URL} (not published)"
+            exit 0
+          fi
+
+          case "$CHANNEL" in
+            production) echo "suffix=" >> "$GITHUB_OUTPUT" ;;
+            staging)    echo "suffix=-staging" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::channel must be 'production' or 'staging'; got '${CHANNEL}'" >&2; exit 1 ;;
+          esac
+
+          case "$SERVER_URL" in
+            https://*) ;;
+            *) echo "::error::publishing requires an explicit https:// server_url; got '${SERVER_URL}'" >&2; exit 1 ;;
+          esac
+          case "$SERVER_URL" in
+            *.invalid|*.invalid/*|*localhost*|*127.0.0.1*)
+              echo "::error::refusing to publish an image built for the non-production origin '${SERVER_URL}'." >&2
+              exit 1 ;;
+          esac
+
+          echo "prefix=" >> "$GITHUB_OUTPUT"
+          echo "Publishing a ${CHANNEL} artifact for ${SERVER_URL}"
+
+      - name: Compute image name
+        id: identity
+        env:
+          REPOSITORY: ${{ github.repository }}
+          SUFFIX: ${{ steps.origin.outputs.suffix }}
+        run: |
+          # GHCR requires a lowercase namespace. The channel suffix makes the
+          # package itself the trust boundary rather than a mutable tag.
+          name="ghcr.io/$(echo "$REPOSITORY" | tr '[:upper:]' '[:lower:]')${SUFFIX}"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          echo "image=${name}" >> "$GITHUB_OUTPUT"
+
+      - name: Build runner image
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          target: runner
+          # Identity is the git SHA plus the registry digest. A floating
+          # `latest` tag is deliberately never the source of truth.
+          tags: |
+            ${{ steps.identity.outputs.name }}:${{ steps.origin.outputs.prefix }}${{ steps.sha.outputs.sha }}
+            ${{ steps.identity.outputs.name }}:${{ steps.origin.outputs.prefix }}sha-${{ steps.sha.outputs.short }}
+          push: ${{ inputs.publish == true }}
+          load: ${{ inputs.publish != true }}
+          build-args: |
+            NEXT_PUBLIC_SERVER_URL=${{ inputs.server_url || env.DEFAULT_SERVER_URL }}
+            IMAGE_REVISION=${{ steps.sha.outputs.sha }}
+            IMAGE_SOURCE=${{ github.server_url }}/${{ github.repository }}
+            IMAGE_VERSION=${{ steps.sha.outputs.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Inline attestations turn the push into an OCI image index, which
+          # changes the digest shape consumers see. Provenance is attached
+          # separately below so the deployed digest stays a plain manifest.
+          provenance: false
+          sbom: false
+
+      - name: Assert the runner image is source-free and migration-complete
+        env:
+          # The origin travels as an ENVIRONMENT VARIABLE, never as a `${{ }}`
+          # expansion inside a shell string. `server_url` is a workflow_dispatch
+          # input, and a manual dispatch has no `publish`, so the
+          # publication-policy step returns before the HTTPS validation and the
+          # Dockerfile skips check-production-origin.ts for a non-HTTPS value —
+          # an unvalidated value would reach the assignment below and could
+          # close its quoting. Passing it through the environment means the
+          # shell never parses it as code.
+          EXPECTED_ORIGIN: ${{ inputs.server_url || env.DEFAULT_SERVER_URL }}
+        run: |
+          image="${{ steps.identity.outputs.name }}:${{ steps.origin.outputs.prefix }}${{ steps.sha.outputs.sha }}"
+          if [ "${{ inputs.publish }}" = "true" ]; then docker pull "$image"; fi
+          bash scripts/assert-runner-image.sh "$image"
+
+          # The baked origin is part of the artifact's identity; assert the
+          # image really carries the origin it was supposed to be built for.
+          # `-F` and `--` keep the value data inside grep too.
+          if ! docker run --rm --entrypoint sh \
+              -e "EXPECTED_ORIGIN=${EXPECTED_ORIGIN}" "$image" \
+              -c 'grep -rlF -- "$EXPECTED_ORIGIN" /app/.next >/dev/null 2>&1'; then
+            echo "::error::image does not contain the expected baked origin ${EXPECTED_ORIGIN}" >&2
+            exit 1
+          fi
+          echo "image carries the expected origin: ${EXPECTED_ORIGIN}"
+
+      - name: Assert the source-containing operations image was not published
+        if: inputs.publish
+        run: |
+          # Defence in depth against a future edit that changes `target:`.
+          target_config="$(docker image inspect --format '{{json .Config}}' \
+            "${{ steps.identity.outputs.name }}:${{ steps.origin.outputs.prefix }}${{ steps.sha.outputs.sha }}")"
+          if echo "$target_config" | grep -q '"pnpm","payload","migrate"'; then
+            echo "::error::the operations image was about to be published" >&2
+            exit 1
+          fi
+
+      # ── Provenance attestation ───────────────────────────────────────────
+      # GitHub's artifact attestations are available for public repositories on
+      # every plan, but for PRIVATE or internal repositories they require GitHub
+      # Enterprise Cloud. This repository is private and owned by a personal
+      # account, so on the current plan the attest step would FAIL — a
+      # production workflow that is guaranteed to break the first time it is
+      # used for real.
+      #
+      # Leaving it in unconditionally would be security theatre with a
+      # guaranteed outage attached, and deleting it would silently drop a real
+      # control if the plan changes. So it is gated on an explicit repository
+      # variable, and the summary states plainly which of the two situations
+      # applies. Setting ARTIFACT_ATTESTATIONS_AVAILABLE=true is a documented
+      # activation prerequisite (deploy/ACCEPTANCE.md, PENDING GITHUB
+      # CONFIGURATION).
+      - name: Attest build provenance
+        id: attest
+        if: inputs.publish && vars.ARTIFACT_ATTESTATIONS_AVAILABLE == 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-name: ${{ steps.identity.outputs.name }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      # Creating an attestation is not the same as having a verifiable one.
+      - name: Verify the published attestation
+        if: inputs.publish && vars.ARTIFACT_ATTESTATIONS_AVAILABLE == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          image="${{ steps.identity.outputs.name }}@${{ steps.build.outputs.digest }}"
+          gh attestation verify "oci://${image}" \
+            --repo "${{ github.repository }}" \
+            --signer-workflow "${{ github.repository }}/.github/workflows/build-publish.yml" \
+            || { echo "::error::published image failed attestation verification" >&2; exit 1; }
+          echo "attestation verified for ${image}"
+
+      - name: Record the provenance status honestly
+        if: inputs.publish
+        run: |
+          {
+            echo "### Provenance"
+            if [ "${{ vars.ARTIFACT_ATTESTATIONS_AVAILABLE }}" = "true" ]; then
+              echo "- build provenance attested and verified against this repository"
+            else
+              echo "- **NOT attested.** GitHub artifact attestations require a GitHub"
+              echo "  Enterprise Cloud plan for private repositories, and"
+              echo "  \`ARTIFACT_ATTESTATIONS_AVAILABLE\` is not set to \`true\`."
+              echo "- The release identity is still the immutable registry digest, and"
+              echo "  the VPS entrypoint still enforces channel + release-policy"
+              echo "  authorization. What is missing is cryptographic proof of the"
+              echo "  BUILD's origin."
+              echo "- See deploy/ACCEPTANCE.md — PENDING GITHUB CONFIGURATION."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report immutable identity
+        run: |
+          {
+            echo "### Runner image"
+            echo ""
+            echo "- channel: \`${{ inputs.channel || 'validation (not published)' }}\`"
+            echo "- exact SHA: \`${{ steps.sha.outputs.sha }}\`"
+            echo "- digest: \`${{ steps.build.outputs.digest }}\`"
+            echo "- published: \`${{ inputs.publish == true }}\`"
+            if [ -n "${{ steps.build.outputs.digest }}" ]; then
+              echo "- deploy reference: \`${{ steps.identity.outputs.name }}@${{ steps.build.outputs.digest }}\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

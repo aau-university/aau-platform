@@ -1,0 +1,52 @@
+name: Simulation - Verify Public Media Export
+
+on:
+  push:
+    branches:
+      - simulation/neon-vps-migration-20260907
+    paths:
+      - '.github/workflows/simulation-public-media.yml'
+      - 'migration/simulation/03_public_media_manifest.csv'
+      - 'migration/simulation/04_fetch_public_media.mjs'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-public-media:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+
+      - name: Download and byte-verify every public media object
+        run: node migration/simulation/04_fetch_public_media.mjs migration-simulation-output
+
+      - name: Verify object count and create archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          count="$(find migration-simulation-output/uploads/media -type f | wc -l | tr -d ' ')"
+          test "$count" = "619"
+          test -f migration-simulation-output/PUBLIC_MEDIA_SHA256SUMS
+          (cd migration-simulation-output && sha256sum -c PUBLIC_MEDIA_SHA256SUMS)
+          tar -C migration-simulation-output -czf public-media.tar.gz uploads PUBLIC_MEDIA_SHA256SUMS
+          sha256sum public-media.tar.gz > public-media.tar.gz.sha256
+          printf 'objects=%s\n' "$count"
+          printf 'archive_bytes=%s\n' "$(stat -c %s public-media.tar.gz)"
+          cat public-media.tar.gz.sha256
+
+      - name: Upload verified rehearsal artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: aau-public-media-rehearsal
+          path: |
+            public-media.tar.gz
+            public-media.tar.gz.sha256
+          retention-days: 1
+          if-no-files-found: error

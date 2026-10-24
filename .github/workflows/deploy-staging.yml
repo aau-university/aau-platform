@@ -1,0 +1,417 @@
+name: Deploy staging
+
+# Staging deployment to the SAME university VPS as production, fully isolated
+# from it: its own Compose project, volumes, uploads, backups, release state,
+# operation lock, credentials, GHCR package and loopback port.
+#
+# ── Why staging is a first-class workflow, not a manual step ──────────────
+# Every hardening change in this repository is a change to a deployment path
+# that cannot be exercised in CI: real backups, real restores, a real reverse
+# proxy, a real reboot. Staging is where those are exercised against a real
+# host before production exists. That only works if staging is deployed by the
+# same code and the same procedure production will use — a hand-run script
+# would prove nothing about the automated path.
+#
+# ── Configurable release source ───────────────────────────────────────────
+# During this PR's development staging is deployed from the PR branch, so each
+# fix can be exercised on the real staging host. That is a repository VARIABLE
+# (`STAGING_RELEASE_REF`), never a hardcoded branch name, so the steady state
+# after merge is a settings change and not a workflow redesign:
+#
+#   now:            STAGING_RELEASE_REF = claude/docker-vps-production-hardening-0qttkt
+#   steady state:   STAGING_RELEASE_REF = develop        (develop -> staging)
+#                   PRODUCTION_RELEASE_REF = main        (main    -> production)
+#
+# ── What staging must never be able to do ─────────────────────────────────
+# Publish to the production GHCR package, hold production credentials, or reach
+# the production deploy account. The channel is fixed to `staging` here, the
+# secrets come from the `staging` Environment, and the root-owned entrypoint on
+# the host derives ITS environment from its own installed path — so even a
+# compromised staging key cannot ask for a production deployment.
+
+on:
+  # Every push, on every branch — deliberately unfiltered.
+  #
+  # A branch filter here would have to repeat the branch name that
+  # `STAGING_RELEASE_REF` already holds, and the two would drift: changing the
+  # variable to a branch the filter does not list would silently stop
+  # automatic staging deployments, with nothing anywhere reporting that it had
+  # happened. Instead every push starts a cheap `gate` job that compares the
+  # pushed branch against the variable and skips the rest of the workflow when
+  # they differ. Non-matching pushes cost one short job and show up as skipped.
+  push:
+    branches: ['**']
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: >-
+          Ref or SHA to deploy. Defaults to the configured STAGING_RELEASE_REF.
+        type: string
+        required: false
+      seed_mode:
+        description: >-
+          preserve = keep staging content (default) | full = run the canonical
+          Seed once after deploying | reset-and-full = DESTRUCTIVE, reset the
+          disposable staging content first
+        type: choice
+        options: [preserve, full, reset-and-full]
+        default: preserve
+
+permissions:
+  contents: read
+
+concurrency:
+  # Staging deployments serialize with each other, and never with production:
+  # a separate group, because they are separate environments on one host and
+  # each has its own server-side operation lock anyway.
+  #
+  # The group is CONDITIONAL because the push trigger above is unfiltered. With
+  # a single fixed group and `cancel-in-progress: false`, every push to every
+  # branch would queue behind a running staging deployment — including the
+  # runs that exist only to skip. Runs that will actually deploy share one
+  # group; every other run gets a group of its own and starts immediately.
+  group: >-
+    staging-deployment-${{
+      (github.event_name == 'workflow_dispatch' || github.ref_name == vars.STAGING_RELEASE_REF)
+        && 'release' || github.ref
+    }}
+  cancel-in-progress: false
+
+jobs:
+  # Decides whether this event should deploy at all, and — for a push — fixes
+  # the SHA once, here.
+  #
+  # Pinning matters: `resolve` below checks out a REF, and between the push
+  # that started this run and that checkout, another push can land. Deploying
+  # the branch tip would then silently deploy a commit this run never gated.
+  # `github.sha` is the commit that triggered the run, so the artifact, the
+  # release gate and the deployment all refer to the same thing.
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      deploy: ${{ steps.decide.outputs.deploy }}
+      sha: ${{ steps.decide.outputs.sha }}
+    steps:
+      - id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          BRANCH: ${{ github.ref_name }}
+          PUSHED_SHA: ${{ github.sha }}
+          RELEASE_REF: ${{ vars.STAGING_RELEASE_REF }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            # An operator asked for this explicitly; `resolve` handles the ref.
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            echo "sha=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -z "$RELEASE_REF" ]; then
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::STAGING_RELEASE_REF is not set; no automatic staging deployment."
+            exit 0
+          fi
+
+          if [ "$BRANCH" = "$RELEASE_REF" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            echo "sha=${PUSHED_SHA}" >> "$GITHUB_OUTPUT"
+            echo "::notice::${BRANCH}@${PUSHED_SHA} matches STAGING_RELEASE_REF; deploying to staging."
+          else
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::${BRANCH} is not the staging release branch (${RELEASE_REF}); skipping."
+          fi
+
+  resolve:
+    needs: gate
+    if: needs.gate.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.pin.outputs.sha }}
+      authorized: ${{ steps.authorize.outputs.authorized }}
+    steps:
+      - name: Require a configured staging release source
+        if: vars.STAGING_RELEASE_REF == ''
+        run: |
+          echo "::error::STAGING_RELEASE_REF is not set. It names the approved staging" >&2
+          echo "::error::release lineage (a branch during development, 'develop' in the" >&2
+          echo "::error::steady state). Refusing to deploy without a policy." >&2
+          exit 1
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.gate.outputs.sha || inputs.ref || vars.STAGING_RELEASE_REF }}
+          fetch-depth: 0
+
+      - id: pin
+        # The requested ref reaches the shell through the environment, never
+        # through `${{ }}`: expression expansion happens before bash parses
+        # the script, so a dispatch input like `x'; id #` would otherwise be
+        # executed rather than printed.
+        env:
+          REQUESTED_REF: ${{ needs.gate.outputs.sha || inputs.ref || vars.STAGING_RELEASE_REF }}
+        run: |
+          sha="$(git rev-parse HEAD)"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "Pinned '${REQUESTED_REF}' to ${sha}"
+
+      # Staging trusts a different — deliberately laxer — lineage than
+      # production, but it is still a lineage. An arbitrary SHA is not
+      # deployable even to staging, or "staging" becomes "anything anyone
+      # pushed anywhere".
+      - name: Authorize the resolved SHA against the staging lineage
+        id: authorize
+        env:
+          RELEASE_REF: ${{ vars.STAGING_RELEASE_REF }}
+        run: |
+          sha="${{ steps.pin.outputs.sha }}"
+
+          # Bind `target` to a fetch that SUCCEEDED, never to whatever ref
+          # happens to be on disk. `actions/checkout` runs with fetch-depth: 0,
+          # so a remote-tracking ref for this branch can already exist locally;
+          # with `|| true` a network or authorization failure left that stale
+          # ref in place and the containment test below authorized the SHA
+          # against lineage that may no longer be the approved staging branch.
+          # deploy-production.yml already had this shape — staging did not.
+          target=""
+          if git fetch --quiet --no-tags origin \
+               "+refs/heads/${RELEASE_REF}:refs/remotes/origin/${RELEASE_REF}" 2>/dev/null; then
+            target="refs/remotes/origin/${RELEASE_REF}"
+          elif git fetch --quiet origin \
+               "+refs/tags/${RELEASE_REF}:refs/tags/${RELEASE_REF}" 2>/dev/null; then
+            target="refs/tags/${RELEASE_REF}"
+          else
+            echo "::error::could not fetch STAGING_RELEASE_REF '${RELEASE_REF}' as a branch or a tag." >&2
+            echo "::error::Refusing to authorize against a possibly stale local ref." >&2
+            exit 1
+          fi
+
+          if git merge-base --is-ancestor "$sha" "$target"; then
+            echo "authorized=true" >> "$GITHUB_OUTPUT"
+            echo "${sha} is contained in ${RELEASE_REF} — authorized for staging"
+          else
+            echo "::error::${sha} is NOT contained in '${RELEASE_REF}'." >&2
+            exit 1
+          fi
+
+  # The same exact-SHA gate production uses. Staging is not a place to skip it:
+  # its entire purpose is to prove the release path, and a staging deployment of
+  # an ungated SHA proves the wrong path.
+  release-gate:
+    needs: resolve
+    uses: ./.github/workflows/release-gate.yml
+    with:
+      ref: ${{ needs.resolve.outputs.sha }}
+
+  authorize:
+    needs: [resolve, release-gate]
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+    steps:
+      - name: Refuse an unauthorized commit
+        if: needs.resolve.outputs.authorized != 'true'
+        run: |
+          echo "::error::the resolved SHA was not authorized against the staging lineage." >&2
+          exit 1
+
+      - name: Require a staging origin
+        if: vars.STAGING_SERVER_URL == ''
+        run: |
+          echo "::error::STAGING_SERVER_URL is not set. It is baked into the image at build" >&2
+          echo "::error::time, so a staging image is not interchangeable with a production one." >&2
+          exit 1
+
+      - name: Refuse a staging build for the production origin
+        # Cross-environment confusion in the other direction: an image built for
+        # the production origin but published to the staging channel would serve
+        # production URLs from staging, and would set cookies for the production
+        # domain.
+        if: vars.STAGING_SERVER_URL == vars.PRODUCTION_SERVER_URL
+        run: |
+          echo "::error::STAGING_SERVER_URL is identical to PRODUCTION_SERVER_URL." >&2
+          echo "::error::Staging must have its own hostname; the origin is baked into the" >&2
+          echo "::error::image and drives CORS, CSRF and cookie scope." >&2
+          exit 1
+
+  build:
+    needs: [resolve, release-gate, authorize]
+    uses: ./.github/workflows/build-publish.yml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    with:
+      ref: ${{ needs.resolve.outputs.sha }}
+      publish: true
+      # Fixed, not an input: this workflow must be structurally incapable of
+      # publishing to the production package.
+      channel: staging
+      server_url: ${{ vars.STAGING_SERVER_URL }}
+
+  deploy:
+    needs: [resolve, authorize, build]
+    runs-on: ubuntu-latest
+    outputs:
+      cutover: ${{ steps.cutover.outcome }}
+      smoke: ${{ steps.smoke.outcome }}
+      seed: ${{ steps.seed.outcome }}
+    environment:
+      name: staging
+      url: ${{ vars.STAGING_SERVER_URL }}
+    steps:
+      - name: Guard — refuse to deploy before the staging host exists
+        if: vars.STAGING_VPS_READY != 'true'
+        run: |
+          {
+            echo "### Staging cutover skipped"
+            echo ""
+            echo "The image was built, inspected and published as"
+            echo "\`${{ needs.build.outputs.image }}@${{ needs.build.outputs.digest }}\`."
+            echo ""
+            echo "No cutover was attempted: \`STAGING_VPS_READY\` is not \`true\`."
+            echo "See deploy/STAGING_VPS_CONTRACT.md for what the host needs first."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::STAGING_VPS_READY is not set — refusing to fake a deployment" >&2
+          exit 1
+
+      - name: Configure SSH to the restricted staging deploy account
+        if: vars.STAGING_VPS_READY == 'true'
+        env:
+          SSH_KEY: ${{ secrets.STAGING_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.STAGING_SSH_KNOWN_HOSTS }}
+        run: |
+          if [ -z "$SSH_KNOWN_HOSTS" ]; then
+            echo "::error::STAGING_SSH_KNOWN_HOSTS is not set. Capture the host key once on" >&2
+            echo "::error::the console; trust-on-first-use accepts a machine-in-the-middle." >&2
+            exit 1
+          fi
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_staging
+          chmod 600 ~/.ssh/id_staging
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Deploy the immutable digest to staging
+        id: cutover
+        if: vars.STAGING_VPS_READY == 'true'
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}@${{ needs.build.outputs.digest }}
+        run: |
+          # Identical mechanism to production, with a DIFFERENT account whose
+          # forced command reaches the staging entrypoint. That entrypoint
+          # derives `staging` from its own installed path, so this key cannot
+          # ask for a production deployment even if it is stolen.
+          # BatchMode/ConnectTimeout/ServerAlive*: the forced command restricts what
+          # SSH_ORIGINAL_COMMAND may be, but it does not bound how long SSH waits
+          # to connect, authenticate, or notice a dead transport. Without these an
+          # unresponsive host holds the job to the Actions limit — and because the
+          # deployment concurrency group uses cancel-in-progress: false, it holds
+          # the next deployment behind it too.
+          ssh -i ~/.ssh/id_staging \
+            -o BatchMode=yes \
+            -o ConnectTimeout=15 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile=~/.ssh/known_hosts \
+            -p "${{ secrets.STAGING_SSH_PORT || 22 }}" \
+            "${{ secrets.STAGING_SSH_USER }}@${{ secrets.STAGING_SSH_HOST }}" \
+            -- "${IMAGE}"
+
+      # ── Optional explicit Seed ───────────────────────────────────────────
+      # Never automatic, never a restart-triggered side effect: a chosen input
+      # on a chosen run. `preserve` (the default) skips this entirely, which is
+      # what a normal staging deployment does.
+      - name: Run the explicit one-shot Seed
+        id: seed
+        env:
+          # Through `env:`, never interpolated into the `run` script. The
+          # `choice` type constrains the GitHub UI only — an API or CLI
+          # dispatch can submit any string, and GitHub substitutes it into the
+          # script TEXT before the shell parses it, so a value such as
+          # `full"; echo pwned; #` would close the ssh argument and run a
+          # command on the runner. The allow-list below is the first authority
+          # and the host's forced command is the second.
+          SEED_MODE: ${{ inputs.seed_mode || 'preserve' }}
+        # `inputs.seed_mode || 'preserve'`, not `inputs.seed_mode`: on a push
+        # event there are no inputs at all, so the bare comparison
+        # `inputs.seed_mode != 'preserve'` is true for an EMPTY value — an
+        # automatic deployment would have run `seed ` with no mode. An
+        # automatic deployment must never seed.
+        if: >-
+          vars.STAGING_VPS_READY == 'true' && steps.cutover.outcome == 'success'
+          && (inputs.seed_mode || 'preserve') != 'preserve'
+        run: |
+          # The seed operation is a separate forced command on the staging
+          # account, so this key can trigger exactly two things: a deployment
+          # and a seed — neither of which is a shell.
+          case "$SEED_MODE" in
+            preserve|full|reset-and-full) ;;
+            *) echo "::error::invalid seed_mode '${SEED_MODE}'" >&2; exit 1 ;;
+          esac
+
+          # BatchMode/ConnectTimeout/ServerAlive*: the forced command restricts what
+          # SSH_ORIGINAL_COMMAND may be, but it does not bound how long SSH waits
+          # to connect, authenticate, or notice a dead transport. Without these an
+          # unresponsive host holds the job to the Actions limit — and because the
+          # deployment concurrency group uses cancel-in-progress: false, it holds
+          # the next deployment behind it too.
+          ssh -i ~/.ssh/id_staging \
+            -o BatchMode=yes \
+            -o ConnectTimeout=15 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile=~/.ssh/known_hosts \
+            -p "${{ secrets.STAGING_SSH_PORT || 22 }}" \
+            "${{ secrets.STAGING_SEED_SSH_USER || secrets.STAGING_SSH_USER }}@${{ secrets.STAGING_SSH_HOST }}" \
+            -- "seed ${SEED_MODE}"
+
+      - name: Staging HTTPS smoke test
+        id: smoke
+        if: vars.STAGING_VPS_READY == 'true' && steps.cutover.outcome == 'success'
+        env:
+          # A repository variable is configuration, and configuration
+          # interpolated into a command line is a command-injection surface.
+          # deploy-production.yml passes its origin as ORIGIN for this reason.
+          ORIGIN: ${{ vars.STAGING_SERVER_URL }}
+        run: |
+          set -o pipefail
+          curl --fail --show-error --silent --location \
+            "${ORIGIN}/api/health" | tee /dev/stderr | grep -q '"status":"ok"'
+          curl --fail --show-error --silent --output /dev/null "${ORIGIN}/"
+
+      - name: Report the real outcome
+        if: always() && vars.STAGING_VPS_READY == 'true'
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}@${{ needs.build.outputs.digest }}
+          CUTOVER: ${{ steps.cutover.outcome }}
+          SMOKE: ${{ steps.smoke.outcome }}
+          SEED: ${{ steps.seed.outcome }}
+          SEED_MODE: ${{ inputs.seed_mode || 'preserve' }}
+        run: |
+          {
+            echo "### Staging release report"
+            echo ""
+            echo "- pinned SHA: \`${{ needs.resolve.outputs.sha }}\`"
+            echo "- published artifact: \`${IMAGE}\` (staging channel)"
+            echo "- host cutover: \`${CUTOVER}\`"
+            echo "- seed mode: \`${SEED_MODE}\` (\`${SEED}\`)"
+            echo "- staging HTTPS smoke: \`${SMOKE}\`"
+            echo ""
+            if [ "$CUTOVER" = "success" ] && [ "$SMOKE" = "success" ]; then
+              echo "**STAGING IS SERVING THIS RELEASE.**"
+              echo ""
+              echo "> A green staging deployment is NOT a production readiness signal on"
+              echo "> its own. The real-host properties this repository cannot prove —"
+              echo "> off-host restore, reboot survival, CSF exposure, Apache behaviour"
+              echo "> and cPanel/mail non-regression — are separate drills. See"
+              echo "> deploy/STAGING_VPS_CONTRACT.md."
+            elif [ "$CUTOVER" = "success" ]; then
+              echo "**DEPLOYED ON THE HOST, NOT SERVING PUBLICLY.** Check the Apache"
+              echo "vhost, TLS and CSF before touching the application."
+            else
+              echo "**NOT DEPLOYED.** See the SSH step output for which refusal fired."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

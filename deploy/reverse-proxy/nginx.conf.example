@@ -1,0 +1,102 @@
+# Reference reverse-proxy configuration for the AAU platform.
+#
+# This is a REFERENCE, not an installer. Reuse the university's existing
+# production proxy on :443 — do not install a competing one. Adapt these
+# directives into whatever already owns 80/443 (Nginx, Apache, Caddy, or a
+# control-panel proxy).
+#
+# The behaviours below are the ones Next.js App Router and Payload actually
+# require. They are exercised by `tests/docker/reverse-proxy-simulation.sh`,
+# which runs this configuration against the real runner image.
+#
+# PENDING REAL VPS: TLS issuance/renewal, the HTTP->HTTPS redirect, and
+# re-verification of every behaviour below through the real university proxy.
+
+server {
+    listen 80;
+    server_name <university-domain>;
+
+    # ── Upload size policy ────────────────────────────────────────────────
+    # Must be >= the application's intended upload limit. Media supports
+    # images, video, PDF and audio, so an arbitrarily small cap would break
+    # legitimate university content. Align this number with the application
+    # policy rather than picking a default.
+    #
+    # Scoped to THIS server block, not the `http` context: on a shared Nginx
+    # instance an http-level value silently applies to every other virtual host
+    # that does not override it.
+    client_max_body_size 128m;
+
+    # Give legitimate large CMS uploads room to complete.
+    client_body_timeout   300s;
+    proxy_read_timeout    300s;
+    proxy_send_timeout    300s;
+    # PENDING REAL VPS: enable once a trusted certificate exists.
+    # return 301 https://$host$request_uri;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+
+        # Preserve the original Host so Payload/Next generate correct absolute
+        # URLs and cookies bind to the right origin.
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        # The app is behind TLS termination; without this it cannot know the
+        # external scheme is HTTPS.
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host  $host;
+
+        proxy_http_version 1.1;
+
+        # ── Streaming ───────────────────────────────────────────────────
+        # App Router streams RSC payloads. Nginx buffers proxied responses by
+        # default, which defeats streaming and delays first paint. All three
+        # are required.
+        proxy_buffering    off;
+        proxy_request_buffering off;
+        proxy_cache        off;
+
+        # ── Caching ─────────────────────────────────────────────────────
+        # No blanket proxy cache. /admin, authenticated APIs, drafts and
+        # previews are private and dynamic; respect the Cache-Control that
+        # Next and Payload already send.
+        proxy_set_header X-Accel-Buffering no;
+    }
+
+    # Hashed build assets are content-addressed and safe to cache immutably.
+    #
+    # Next.js already sends `Cache-Control: public, max-age=31536000, immutable`
+    # for these, so nothing is set here: `add_header` would APPEND a second
+    # Cache-Control field rather than replace the first. A `proxy_cache_valid`
+    # was removed for the same class of reason — with no `proxy_cache` zone
+    # selected it enables no caching at all, so it read as protection that was
+    # not there. To add real proxy caching, declare a `proxy_cache_path`, select
+    # it with `proxy_cache`, and only then set `proxy_cache_valid`.
+    location /_next/static/ {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host $host;
+    }
+
+    # Never cache the admin panel or authenticated API surface.
+    location ~ ^/(admin|api)/ {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_http_version 1.1;
+        proxy_buffering off;
+        proxy_cache     off;
+        add_header Cache-Control "no-store" always;
+    }
+}
+
+# ── TLS server block (PENDING REAL VPS) ───────────────────────────────────
+# server {
+#     listen 443 ssl http2;
+#     server_name <university-domain>;
+#     ssl_certificate     /etc/letsencrypt/live/<university-domain>/fullchain.pem;
+#     ssl_certificate_key /etc/letsencrypt/live/<university-domain>/privkey.pem;
+#     # ... same location blocks as above ...
+# }

@@ -1,0 +1,21 @@
+/**
+ * AAU public-site global stylesheet.
+ *
+ * Ported from the legacy `frontend/app/globals.css`:
+ *   - Tailwind 3 layers
+ *   - Black + gold design tokens (HSL channels for shadcn-style overrides)
+ *   - Tajawal everywhere
+ *   - A handful of custom utilities used by the ported homepage sections
+ *
+ * Dark mode tokens are intentionally omitted in this port — a single light
+ * theme matches the legacy site default. Dark theme is Phase 1.5.
+ */
+
+@import '../../styles/tokens.css';
+@import '../../styles/theme.css';
+@import '../../styles/utilities.css';
+@import '../../styles/animations.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;

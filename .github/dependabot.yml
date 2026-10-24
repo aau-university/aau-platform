@@ -1,0 +1,75 @@
+version: 2
+
+# Digest/SHA pinning is only safe when something keeps the pins current —
+# an unmaintained pin freezes security fixes indefinitely. These update rules
+# are the other half of that policy (see deploy/README.md).
+updates:
+  # GitHub Actions. Every workflow `uses:` entry is pinned to a full commit
+  # SHA with a trailing version comment; Dependabot updates the SHA and that
+  # comment together, so the pins keep moving through reviewed PRs instead of
+  # going stale.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: 'chore(actions)'
+
+  # Container base images. The `docker` ecosystem is scoped to a directory, so
+  # each location holding image references needs its own entry:
+  #   /        — the root Dockerfile (node base images, digest-pinned)
+  #   /deploy  — docker-compose.vps.yml (postgres and redis, digest-pinned)
+  # Without the /deploy entry the production Postgres/Redis digests would never
+  # get update PRs, which is exactly the stale-pin failure this policy exists to
+  # prevent.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: 'chore(docker)'
+
+  # `docker-compose`, not `docker`: /deploy contains no Dockerfile — the pins
+  # that need watching are the postgres and redis image digests inside
+  # docker-compose.vps.yml, and the `docker` ecosystem looks for Dockerfiles and
+  # Kubernetes manifests. With the wrong identifier this entry finds no manifest
+  # and silently produces no update PRs, which is the stale-pin outcome it is
+  # here to prevent.
+  - package-ecosystem: docker-compose
+    directory: /deploy
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: 'chore(docker)'
+
+  # Application dependencies. Base-image and action pins were kept current
+  # while the much larger npm dependency surface — which is what actually ships
+  # in the runner image — had no update policy at all. Grouped so a weekly run
+  # produces a small number of reviewable PRs rather than dozens: patch and
+  # minor updates travel together, and majors come individually because they
+  # need real review.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    versioning-strategy: increase
+    commit-message:
+      prefix: 'chore(deps)'
+      prefix-development: 'chore(deps-dev)'
+    groups:
+      production-patch-and-minor:
+        dependency-type: production
+        update-types: ['minor', 'patch']
+      development-patch-and-minor:
+        dependency-type: development
+        update-types: ['minor', 'patch']
+    ignore:
+      # Payload's packages must move together — `pnpm check:payload-versions`
+      # enforces that, and a single-package bump would just fail the gate.
+      # They are updated deliberately, as a set.
+      - dependency-name: 'payload'
+      - dependency-name: '@payloadcms/*'

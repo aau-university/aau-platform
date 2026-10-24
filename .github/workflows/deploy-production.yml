@@ -1,0 +1,446 @@
+name: Deploy production release
+
+# Cuts production over to an ALREADY-PUBLISHED artifact. This workflow never
+# builds: it takes a digest that `release-production.yml` produced, proves it is
+# a real production-channel artifact built from an approved commit, and deploys
+# exactly that.
+#
+#   approved main commit -> release gate -> build + publish once
+#     -> operator records the digest in the host allow-list
+#     -> THIS WORKFLOW deploys that exact digest
+#
+# The artifact that was gated, inspected and authorized is byte-for-byte the
+# artifact that runs. See release-production.yml for why the two are separate.
+#
+# ── STATUS: STRUCTURE COMPLETE, CUTOVER GATED ────────────────────────────
+# Every step that would touch a server is gated behind
+# `vars.PRODUCTION_VPS_READY == 'true'` AND the `production` GitHub Environment,
+# so this workflow cannot perform a real cutover until an operator deliberately
+# provisions both.
+#
+# ── LOCAL READY comes before LIVE ────────────────────────────────────────
+# The university's public domain is not routed to this VPS yet, and that is
+# intentional: the application is brought up, migrated and promoted on the
+# host's loopback port first, and the DNS/TLS/proxy cutover is a separate,
+# later act. So a public HTTPS probe is NOT part of the deployment gate until
+# `PRODUCTION_PUBLIC_READY` says the origin is live. Failing a deployment on a
+# domain that deliberately points elsewhere would report a working release as
+# broken, and the only "fix" would be to redeploy the same image.
+#
+# What proves LOCAL READY is the cutover itself. `deploy.sh` promotes onto the
+# stable loopback port only after the candidate has passed `/api/health` — which
+# initializes Payload, reads PostgreSQL and reports 503 if the identity
+# bootstrap failed — and then waits for the promoted container to report healthy
+# too. A successful cutover therefore already means "migrated, bootstrapped and
+# serving 127.0.0.1:3000". No extra host capability is needed to observe it, and
+# none is granted.
+#
+# After DNS moves, run **Verify production public origin**
+# (verify-production-public.yml) to confirm the same running release over HTTPS,
+# and set `PRODUCTION_PUBLIC_READY=true` so every later deployment includes the
+# public probe again. Neither step rebuilds or redeploys anything.
+#
+# To activate, once the VPS exists:
+#   1. create the `production` GitHub Environment, restricted to the release
+#      ref (normally `main`), with required reviewers;
+#   2. add secrets: VPS_SSH_HOST, VPS_SSH_USER, VPS_SSH_KEY, VPS_SSH_PORT and
+#      VPS_SSH_KNOWN_HOSTS (the host key captured once on the console — the
+#      workflow refuses to fall back to trust-on-first-use);
+#   3. set repository variable PRODUCTION_VPS_READY=true;
+#   4. set PRODUCTION_SERVER_URL=https://aau.edu.ye and
+#      PRODUCTION_RELEASE_REF=main (the approved release lineage);
+#   5. enable branch/ruleset protection on the release ref;
+#   6. provision the deploy account per deploy/STAGING_VPS_CONTRACT.md — a
+#      NON-root user whose only privileged capability is the root-owned
+#      entrypoint at /srv/aau/production/deploy/scripts/deploy-entrypoint.sh,
+#      via a single wildcard-free sudoers rule. Membership of the `docker`
+#      group is equivalent to root and must NOT be granted.
+
+on:
+  workflow_dispatch:
+    inputs:
+      digest:
+        description: 'sha256:<64 hex> of a published production image (from Prepare production release)'
+        type: string
+        required: true
+      confirm:
+        description: 'Type DEPLOY to confirm a real production cutover'
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  # A production deployment must QUEUE, never cancel: cancelling mid-backup,
+  # mid-migration or mid-cutover is how you get a half-migrated database.
+  group: production-deployment
+  cancel-in-progress: false
+
+jobs:
+  # ── 0. Prove the digest is an approved production artifact ──────────────
+  # The digest arrives as free text from a dispatch form. Three things have to
+  # be true before it reaches a root context on the VPS, and none of them can be
+  # taken on trust:
+  #
+  #   shape    an immutable digest, never a tag;
+  #   channel  it exists in the PRODUCTION GHCR package (staging is a separate
+  #            package precisely so the package is the trust boundary);
+  #   lineage  the commit it was built from is contained in the approved release
+  #            ref — re-derived from the ARTIFACT's own revision label, not from
+  #            anything the dispatcher typed.
+  #
+  # The host re-validates all three independently; this is the half that can
+  # give the operator a useful error before a maintenance window opens.
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      image: ${{ steps.pull.outputs.image }}
+      revision: ${{ steps.pull.outputs.revision }}
+      authorized: ${{ steps.lineage.outputs.authorized }}
+    steps:
+      - name: Validate the digest shape
+        id: shape
+        env:
+          DIGEST: ${{ inputs.digest }}
+        run: |
+          # A bare `sha256:<64 lowercase hex>` contains nothing a shell could
+          # reinterpret, which is what makes it safe to pass onward.
+          case "$DIGEST" in
+            sha256:*) ;;
+            *) echo "::error::digest must start with 'sha256:'; got '${DIGEST}'" >&2; exit 1 ;;
+          esac
+          hex="${DIGEST#sha256:}"
+          if ! printf '%s' "$hex" | grep -Eq '^[a-f0-9]{64}$'; then
+            echo "::error::digest must be sha256:<64 lowercase hex>; got '${DIGEST}'" >&2
+            exit 1
+          fi
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull the exact artifact from the production package
+        id: pull
+        env:
+          DIGEST: ${{ steps.shape.outputs.digest }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          # No channel suffix: this is the PRODUCTION package. A staging digest
+          # simply does not exist under this name, so it cannot be deployed here
+          # even by someone who knows its value.
+          name="ghcr.io/$(echo "$REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          image="${name}@${DIGEST}"
+          if ! docker pull "$image"; then
+            echo "::error::${image} could not be pulled. Either the digest does not exist" >&2
+            echo "::error::in the production package, or it belongs to another channel." >&2
+            echo "::error::Run 'Prepare production release' first and use the digest it reports." >&2
+            exit 1
+          fi
+
+          revision="$(docker image inspect --format \
+            '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")"
+          if ! printf '%s' "$revision" | grep -Eq '^[a-f0-9]{40}$'; then
+            echo "::error::the image does not carry a usable revision label (got '${revision}')." >&2
+            echo "::error::Release identity cannot be traced back to a commit; refusing." >&2
+            exit 1
+          fi
+
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "revision=${revision}" >> "$GITHUB_OUTPUT"
+          echo "Artifact ${image} was built from ${revision}"
+
+      - name: Authorize the artifact's own commit against the release lineage
+        id: lineage
+        env:
+          RELEASE_REF: ${{ vars.PRODUCTION_RELEASE_REF }}
+          REVISION: ${{ steps.pull.outputs.revision }}
+        run: |
+          if [ -z "$RELEASE_REF" ]; then
+            echo "authorized=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::PRODUCTION_RELEASE_REF is not configured, so release lineage cannot be verified. Deployment will not be authorized."
+            exit 0
+          fi
+
+          # The lineage ref must be FETCHED, not merely present. `|| true` on
+          # both fetches meant a network or authorization failure fell through
+          # to whatever `actions/checkout` had already put in the object store,
+          # and the containment test below would then authorize this artifact
+          # against a stale ref — one that may predate the commit being
+          # deployed, or may no longer be the approved release at all.
+          #
+          # Which ref answered is also recorded here rather than re-derived, so
+          # the ref that was fetched is the ref that is checked.
+          target=""
+          if git fetch --quiet --no-tags origin \
+               "+refs/heads/${RELEASE_REF}:refs/remotes/origin/${RELEASE_REF}" 2>/dev/null; then
+            target="refs/remotes/origin/${RELEASE_REF}"
+          elif git fetch --quiet origin \
+               "+refs/tags/${RELEASE_REF}:refs/tags/${RELEASE_REF}" 2>/dev/null; then
+            target="refs/tags/${RELEASE_REF}"
+          else
+            echo "::error::could not fetch PRODUCTION_RELEASE_REF '${RELEASE_REF}' as a branch or a tag." >&2
+            echo "::error::Refusing to authorize against a possibly stale local ref." >&2
+            exit 1
+          fi
+
+          if ! git cat-file -e "${REVISION}^{commit}" 2>/dev/null; then
+            echo "::error::the artifact's revision ${REVISION} is not a commit in this repository." >&2
+            exit 1
+          fi
+
+          # `merge-base --is-ancestor` is the containment test: it succeeds only
+          # when the commit is genuinely part of the release ref's history. The
+          # commit is read from the IMAGE, so an operator cannot authorize a
+          # different commit than the one that was actually built.
+          if git merge-base --is-ancestor "$REVISION" "$target"; then
+            echo "authorized=true" >> "$GITHUB_OUTPUT"
+            echo "${REVISION} is contained in ${RELEASE_REF} — authorized for production"
+          else
+            echo "::error::${REVISION} is NOT contained in the release ref '${RELEASE_REF}'." >&2
+            echo "::error::Only artifacts built from the approved release ref may be deployed." >&2
+            exit 1
+          fi
+
+  # ── 1. AUTHORIZE — the human gate, before anything on the host moves ────
+  authorize:
+    needs: verify
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    steps:
+      - name: Verify the operator typed the exact confirmation
+        if: inputs.confirm != 'DEPLOY'
+        run: |
+          echo "::error::confirm input must be exactly 'DEPLOY'; nothing has been changed." >&2
+          exit 1
+
+      - name: Refuse an unauthorized artifact
+        if: needs.verify.outputs.authorized != 'true'
+        run: |
+          echo "::error::the artifact was not authorized against a release lineage." >&2
+          echo "::error::Set repository variable PRODUCTION_RELEASE_REF to the approved" >&2
+          echo "::error::release branch or tag (normally 'main') before deploying." >&2
+          exit 1
+
+      - name: Record the authorization
+        run: |
+          {
+            echo "### Authorized for cutover"
+            echo "- artifact: \`${{ needs.verify.outputs.image }}\`"
+            echo "- built from: \`${{ needs.verify.outputs.revision }}\`"
+            echo "- release lineage: \`${{ vars.PRODUCTION_RELEASE_REF }}\`"
+            echo "- public origin live: \`${{ vars.PRODUCTION_PUBLIC_READY == 'true' }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── 2. Cutover (gated) ──────────────────────────────────────────────────
+  deploy:
+    needs: [verify, authorize]
+    runs-on: ubuntu-latest
+    outputs:
+      cutover: ${{ steps.cutover.outcome }}
+      smoke: ${{ steps.smoke.outcome }}
+    environment:
+      name: production
+      # Only claim the public URL once it actually serves this deployment.
+      # Before DNS moves, an Environment linking to the university domain would
+      # point reviewers at whatever currently answers there.
+      url: ${{ vars.PRODUCTION_PUBLIC_READY == 'true' && vars.PRODUCTION_SERVER_URL || '' }}
+    steps:
+      - name: Guard — refuse to deploy before the VPS exists
+        if: vars.PRODUCTION_VPS_READY != 'true'
+        run: |
+          {
+            echo "### Production cutover skipped"
+            echo ""
+            echo "The artifact \`${{ needs.verify.outputs.image }}\` was verified against the"
+            echo "production package and the approved release lineage, and nothing was built."
+            echo ""
+            echo "No VPS cutover was attempted: repository variable"
+            echo "\`PRODUCTION_VPS_READY\` is not \`true\`. See deploy/README.md."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::PRODUCTION_VPS_READY is not set — refusing to fake a deployment" >&2
+          exit 1
+
+      - name: Configure SSH to the restricted deploy account
+        if: vars.PRODUCTION_VPS_READY == 'true'
+        env:
+          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          # The host key is pinned as a secret, captured once out-of-band when
+          # the VPS is provisioned. `ssh-keyscan` at deploy time would trust
+          # whatever key answers — trust-on-first-use every run, which accepts
+          # a machine-in-the-middle silently.
+          SSH_KNOWN_HOSTS: ${{ secrets.VPS_SSH_KNOWN_HOSTS }}
+        run: |
+          if [ -z "$SSH_KNOWN_HOSTS" ]; then
+            echo "::error::VPS_SSH_KNOWN_HOSTS is not set. Capture the host key once on the console" >&2
+            echo "::error::(ssh-keyscan -p <port> <host>) and store it as a repository secret." >&2
+            exit 1
+          fi
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Deploy the immutable digest
+        id: cutover
+        if: vars.PRODUCTION_VPS_READY == 'true'
+        env:
+          IMAGE: ${{ needs.verify.outputs.image }}
+        run: |
+          # The SSH account is non-root and is NOT in the docker group. Its key
+          # carries an authorized_keys forced command (ssh-forced-command.sh), so
+          # sshd ignores whatever is requested and always runs that wrapper; the
+          # image reference below arrives only as $SSH_ORIGINAL_COMMAND. The
+          # wrapper forwards that single token to the root-owned entrypoint via
+          # a wildcard-free NOPASSWD sudo rule, and the entrypoint re-validates
+          # it on three axes: digest shape, production channel, and the host's
+          # own release policy.
+          #
+          # So we send ONLY the image reference — not a command. A stolen key
+          # can at most redeploy a digest the host already authorizes.
+          #
+          # The host script owns the whole sequence: operation lock, pre-pull,
+          # verified backup, candidate validation on a private port, promotion,
+          # release-state recording. CI never receives production database
+          # credentials — Payload applies its own migrations at container start.
+          # BatchMode/ConnectTimeout/ServerAlive*: the forced command restricts what
+          # SSH_ORIGINAL_COMMAND may be, but it does not bound how long SSH waits
+          # to connect, authenticate, or notice a dead transport. Without these an
+          # unresponsive host holds the job to the Actions limit — and because the
+          # deployment concurrency group uses cancel-in-progress: false, it holds
+          # the next deployment behind it too.
+          ssh -i ~/.ssh/id_deploy \
+            -o BatchMode=yes \
+            -o ConnectTimeout=15 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile=~/.ssh/known_hosts \
+            -p "${{ secrets.VPS_SSH_PORT || 22 }}" \
+            "${{ secrets.VPS_SSH_USER }}@${{ secrets.VPS_SSH_HOST }}" \
+            -- "${IMAGE}"
+
+      # ── Public HTTPS smoke — only once the origin is actually live ───────
+      # Before DNS moves, the university domain deliberately answers from
+      # somewhere else, so probing it would fail a perfectly good release and
+      # invite a pointless redeploy. `PRODUCTION_PUBLIC_READY` is the switch
+      # between "LOCAL READY is the goal" and "LIVE is the goal"; the report
+      # below states which one this run was measured against, so a skipped probe
+      # is never mistaken for a passed one.
+      - name: Public HTTPS smoke test
+        id: smoke
+        if: >-
+          vars.PRODUCTION_VPS_READY == 'true' && steps.cutover.outcome == 'success'
+          && vars.PRODUCTION_PUBLIC_READY == 'true'
+        env:
+          # The origin travels as an ENVIRONMENT VARIABLE, never as a `${{ }}`
+          # expansion inside a shell string: a repository variable is
+          # configuration, and configuration interpolated into a command line is
+          # a command-injection surface however trusted the person who set it.
+          ORIGIN: ${{ vars.PRODUCTION_SERVER_URL }}
+        run: |
+          set -o pipefail
+          curl --fail --show-error --silent --location \
+            "${ORIGIN}/api/health" | tee /dev/stderr | grep -q '"status":"ok"'
+          curl --fail --show-error --silent --output /dev/null "${ORIGIN}/"
+
+      # ── Truthful final state ─────────────────────────────────────────────
+      # Each distinguishable outcome gets its own honest report, and the
+      # remediation differs between them because the correct action genuinely
+      # differs. "Deployed" is never printed for a run that did not deploy.
+      - name: Report the real outcome
+        if: always() && vars.PRODUCTION_VPS_READY == 'true'
+        env:
+          IMAGE: ${{ needs.verify.outputs.image }}
+          REVISION: ${{ needs.verify.outputs.revision }}
+          CUTOVER: ${{ steps.cutover.outcome }}
+          SMOKE: ${{ steps.smoke.outcome }}
+          PUBLIC_READY: ${{ vars.PRODUCTION_PUBLIC_READY }}
+          ORIGIN: ${{ vars.PRODUCTION_SERVER_URL }}
+        run: |
+          {
+            echo "### Production release report"
+            echo ""
+            echo "- artifact: \`${IMAGE}\`"
+            echo "- built from: \`${REVISION}\`"
+            echo "- host cutover: \`${CUTOVER}\`"
+            echo "- public origin live: \`${PUBLIC_READY:-false}\`"
+            echo "- public HTTPS smoke: \`${SMOKE}\`"
+            echo ""
+
+            if [ "$CUTOVER" != "success" ] && [ "$CUTOVER" != "failure" ]; then
+              echo "**NOT DEPLOYED.** The cutover did not run (\`${CUTOVER}\`)."
+            elif [ "$CUTOVER" = "failure" ]; then
+              echo "**NOT DEPLOYED.** The host script refused or failed."
+              echo ""
+              echo "Read the SSH step output above: it distinguishes the cases, and"
+              echo "they need different responses."
+              echo ""
+              echo "- *not in the host allow-list* — the digest was never recorded in"
+              echo "  the root-owned authorized-releases file. Nothing was changed."
+              echo "  Record it and re-run; do NOT rebuild, which would produce a"
+              echo "  different digest."
+              echo "- *pre-cutover backup failed* — production was never changed and"
+              echo "  the previous release was restored to service. Fix the backup"
+              echo "  (usually disk space) and re-run."
+              echo "- *candidate failed, schema unchanged* — the previous release was"
+              echo "  restarted automatically and the maintenance window is closed."
+              echo "  Nothing to recover; fix the release."
+              echo "- *candidate failed AFTER applying migrations* — nothing is serving,"
+              echo "  deliberately: the previous build predates the current schema."
+              echo "  This is a live incident. Recover with \`restore.sh\`, which"
+              echo "  restores the database AND the image recorded with the backup."
+              echo "- *dirty-database refusal* — investigate the database by hand"
+              echo "  before doing anything else."
+            elif [ "$PUBLIC_READY" != "true" ]; then
+              echo "**PRODUCTION LOCAL READY.**"
+              echo ""
+              echo "The host completed the full sequence: verified pre-deployment backup,"
+              echo "candidate on 127.0.0.1:3001, pending Payload migrations, identity"
+              echo "validation, candidate health, promotion. The release is serving"
+              echo "\`127.0.0.1:3000\` on the VPS."
+              echo ""
+              echo "It is NOT public yet, and this run did not pretend to check that:"
+              echo "\`PRODUCTION_PUBLIC_READY\` is not \`true\`, so the public HTTPS probe"
+              echo "was skipped rather than failed."
+              echo ""
+              echo "Next, as a host-side operation and WITHOUT redeploying this image:"
+              echo "DNS, the cPanel/Apache vhost, TLS and the firewall, forwarding"
+              echo "\`${ORIGIN}\` to \`127.0.0.1:3000\`. Then run"
+              echo "**Verify production public origin** to confirm the same running"
+              echo "release over HTTPS, and set \`PRODUCTION_PUBLIC_READY=true\` so every"
+              echo "later deployment includes the public probe again."
+            elif [ "$SMOKE" = "success" ]; then
+              echo "**PRODUCTION LIVE.** The host reported a successful cutover and the"
+              echo "public HTTPS origin serves a healthy application."
+            else
+              echo "**DEPLOYED ON THE HOST, BUT NOT SERVING PUBLICLY.**"
+              echo ""
+              echo "The new release passed its candidate health gate and was promoted"
+              echo "onto the loopback port, so migrations and the identity bootstrap"
+              echo "DID complete and the database has already moved forward."
+              echo ""
+              echo "The public origin did not answer correctly. That is a proxy, TLS,"
+              echo "DNS or firewall problem far more often than an application one —"
+              echo "check Apache's vhost and error log, the certificate, and CSF."
+              echo ""
+              echo "> Do NOT respond by redeploying an older image. If this release"
+              echo "> applied migrations, the previous build does not understand the"
+              echo "> current schema. The migration-aware recovery is"
+              echo "> \`deploy/scripts/restore.sh <backup>\`, which restores the"
+              echo "> database AND the application image recorded with it."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

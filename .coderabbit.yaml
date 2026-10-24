@@ -1,0 +1,171 @@
+# CodeRabbit Configuration
+# Docs: https://docs.coderabbit.ai/reference/configuration
+#
+# What the exclusions below are for: keeping GENERATED and BINARY files out of
+# the reviewable diff, so the human-authored change is what gets read. They are
+# not a size-management trick, and nothing security-critical may be hidden
+# behind them — the deployment scripts, the migration tooling, the GitHub
+# workflows and the drills that test them are all deliberately reviewable.
+#
+# `drafts: false` keeps automatic review off work-in-progress branches. A draft
+# PR is still reviewed on demand with an explicit `@coderabbitai full review`
+# comment, which is how the deployment/migration work on this repository is
+# reviewed.
+
+# Reviews should run on every PR but skip trivial chores.
+reviews:
+  profile: chill            # concise, actionable reviews; less noise
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false               # keep output professional
+  review_status: true       # post a status check to GitHub
+  sequence_diagrams: false
+  collapse_walkthrough: true
+  auto_review:
+    enabled: true
+    drafts: false           # ignore draft PRs
+    base_branches:
+      - main
+      - develop
+
+  # Exclude files that don't benefit from AI review. This trims ~12-30
+  # files per diff (logs, generated types, lockfiles, images) so the
+  # reviewable set is as small as possible.
+  path_filters:
+    # --- Lockfiles & build artifacts ---
+    - "!**/pnpm-lock.yaml"
+    - "!**/package-lock.json"
+    - "!**/yarn.lock"
+    - "!**/*.tsbuildinfo"
+    # --- Generated Payload types & schema (regenerated via pnpm generate:types) ---
+    - "!src/payload-types.ts"
+    - "!src/payload-generated-schema.ts"
+    # --- Build output & caches ---
+    - "!**/.next/**"
+    - "!**/dist/**"
+    - "!**/build/**"
+    - "!**/coverage/**"
+    - "!**/.turbo/**"
+    # --- Logs (dev/server/seed output) ---
+    - "!**/*.log"
+    - "!dev-out.log"
+    - "!dev-err.log"
+    # --- Binary assets (images are reviewed visually, not line-by-line) ---
+    - "!**/*.png"
+    - "!**/*.jpg"
+    - "!**/*.jpeg"
+    - "!**/*.gif"
+    - "!**/*.webp"
+    - "!**/*.ico"
+    - "!**/*.svg"
+    # --- Migrations are auto-generated schema diffs; skip unless authored by hand ---
+    - "!src/migrations/**/*.json"
+    # --- Documentation ---
+    # Prose is mostly excluded because it is not code, but the exclusions are
+    # listed per directory rather than as a blanket `!**/*.md`.
+    #
+    # Two reasons, and the second is the load-bearing one:
+    #
+    #   1. deploy/ and migration/ documents are the procedures an operator
+    #      follows against a real database. A wrong instruction there is an
+    #      incident, not a typo, and a document that has drifted from the code
+    #      it describes is a review finding. They must be reviewable.
+    #
+    #   2. `path_filters` switches to ALLOW-LIST semantics the moment it
+    #      contains a single positive pattern: anything not matched by an
+    #      include is then excluded. Re-including the two directories with
+    #      `deploy/**/*.md` did exactly that and skipped the review of all 144
+    #      changed files ("excluded by none and included by none"). So this
+    #      list stays PURELY NEGATIVE, and coverage is widened by removing
+    #      exclusions rather than by adding inclusions.
+    - "!**/*.mdx"
+    - "!**/docs/**"
+    - "!src/**/*.md"
+    - "!.github/**/*.md"
+    - "!README*"
+    - "!CHANGELOG*"
+    - "!LICENSE*"
+    - "!CONTRIBUTING*"
+    - "!AGENTS.md"
+    # --- Agent/automation artifacts (not application code) ---
+    - "!.agents/**"
+    - "!.codegraph/**"
+    - "!.cursor/**"
+    - "!.github/**/*.md"
+    # --- Scratch/debug files at repo root ---
+    - "!*.txt"
+    - "!*.html"
+    - "!capture.js"
+    - "!check-db.ts"
+    - "!reset-admin.ts"
+
+  # Per-path instructions: tell the reviewer what matters most in each area.
+  path_instructions:
+    - path: "src/access/**"
+      instructions: |
+        Focus on authorization correctness: ensure every collection has
+        access control, that `overrideAccess: false` is used when acting
+        on behalf of a user, and that role checks (is-admin, has-role)
+        cannot be bypassed by an unauthenticated caller.
+    - path: "src/hooks/**"
+      instructions: |
+        Verify hooks thread `req` through nested operations (transaction
+        atomicity), guard against infinite loops via `req.context`, and
+        do not leak secrets in afterErrorLogger.
+    - path: "src/proxy.ts"
+      instructions: |
+        Treat as security-critical: CSP must be nonce-based, no
+        `'unsafe-inline'` for scripts, secrets must never appear in
+        headers, and the locale init script hash must stay in sync.
+    - path: "src/lib/payload/**"
+      instructions: |
+        Public data loaders — check for over-fetching (depth/limit), and
+        ensure no admin-only fields leak into public responses.
+    - path: "src/app/actions/**"
+      instructions: |
+        Server actions — verify input validation (zod), rate limiting,
+        and that no privileged operation runs without an auth check.
+    - path: "src/app/api/**"
+      instructions: |
+        Route handlers — same concerns as actions, plus correct HTTP
+        status codes and no CORS relaxation on sensitive endpoints.
+    - path: "**/*.tsx"
+      instructions: |
+        React Server Components by default; flag any `'use client'` that
+        does DB/payload work directly, and any interactive element
+        missing accessibility (role/aria) when onClick is used.
+    - path: "deploy/scripts/**"
+      instructions: |
+        These run as root on a VPS that also serves the university's mail
+        and DNS, and they move real data. Review for: destructive actions
+        that happen before every fallible step has succeeded; a check that
+        cannot distinguish "observed safe" from "could not observe" (the
+        second must fail closed); `set -e` suspension around `||`, `&&` and
+        command substitution swallowing a failure; a refusal that can be
+        reached around by an environment variable at a privilege boundary;
+        and any path where a failure leaves nothing serving without saying
+        so. Release identity must stay an immutable digest read from the
+        release-state file, never from configuration.
+    - path: "migration/**"
+      instructions: |
+        Staging-only migration tooling. Review for anything that could make
+        it runnable against production, anything that weakens the
+        fail-closed source/target contracts, and any ordering where a
+        destructive step precedes a fallible one.
+    - path: ".github/workflows/**"
+      instructions: |
+        Treat as a supply-chain surface. Third-party actions must be pinned
+        to a full-length commit SHA. Check that authorization (release
+        lineage containment, the Environment gate and the typed
+        confirmation) precedes PUBLICATION and not merely deployment, that
+        a staging workflow cannot publish to the production package, and
+        that no step reports a deployment that did not happen.
+    - path: "tests/**"
+      instructions: |
+        These are drills, not unit tests: they assert against real
+        databases, real containers and the real scripts. Flag any assertion
+        that cannot fail — a grep for a string the script always prints, a
+        comparison of a value against itself, an exit status discarded by a
+        pipeline or `|| true`, or a probe whose absence would read as a pass.
+
+language: en-US

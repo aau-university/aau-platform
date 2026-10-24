@@ -1,0 +1,125 @@
+name: Verify production public origin
+
+# Confirms that the release ALREADY RUNNING on the production VPS is reachable
+# over its public HTTPS origin. It builds nothing, publishes nothing, touches no
+# host and changes no state — it is a read-only probe of the university domain.
+#
+# ── Why this exists as its own workflow ───────────────────────────────────
+# The first production release reaches PRODUCTION LOCAL READY before DNS points
+# at this VPS: the host promotes the candidate onto 127.0.0.1:3000 and stops
+# there, deliberately. The remaining work — DNS, the cPanel/Apache vhost, TLS,
+# the firewall — is host-side and changes nothing about the application.
+#
+# Without this workflow, the only way to check the domain afterwards would be to
+# re-run the deployment, which would take a maintenance window, a fresh backup
+# and a candidate promotion to test a DNS record. That is why the public probe
+# is not merely `if:`-skipped inside the deployment: it is separable work, so it
+# is a separable workflow.
+#
+# After this passes, set repository variable `PRODUCTION_PUBLIC_READY=true`, and
+# every later deployment includes the public probe in its own gate again.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Once the origin is public this doubles as an uptime canary. It is a
+    # no-op — and says so — while PRODUCTION_PUBLIC_READY is unset, so enabling
+    # it early costs nothing.
+    - cron: '17 6 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-public-verification
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a configured production origin
+        # Not on a pre-cutover SCHEDULED run: before DNS exists neither variable
+        # is set, and failing the schedule turns the documented no-op state into
+        # a recurring red run that says nothing. A manual dispatch, or a
+        # scheduled run once public readiness is declared, still must have one.
+        if: >-
+          vars.PRODUCTION_SERVER_URL == ''
+          && (github.event_name != 'schedule' || vars.PRODUCTION_PUBLIC_READY == 'true')
+        run: |
+          echo "::error::PRODUCTION_SERVER_URL is not set, so there is no origin to verify." >&2
+          exit 1
+
+      - name: Skip quietly while the origin is not meant to be public
+        id: gate
+        env:
+          PUBLIC_READY: ${{ vars.PRODUCTION_PUBLIC_READY }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          # A SCHEDULED run before the cutover is not a failure — the domain is
+          # supposed to point elsewhere. A MANUAL run is how an operator checks
+          # whether the cutover has landed, so it always probes.
+          if [ "$EVENT" = "schedule" ] && [ "$PUBLIC_READY" != "true" ]; then
+            echo "probe=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::PRODUCTION_PUBLIC_READY is not 'true'; the origin is not expected to be public yet."
+          else
+            echo "probe=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Probe the public origin
+        id: smoke
+        if: steps.gate.outputs.probe == 'true'
+        env:
+          ORIGIN: ${{ vars.PRODUCTION_SERVER_URL }}
+        run: |
+          # -e matters as much as pipefail here: without it a failing
+          # /api/health pipeline only sets a status nobody reads, execution
+          # falls through to the home-page request, and a reachable `/` makes
+          # the whole step succeed — which the report below prints as
+          # PRODUCTION LIVE while the API is down.
+          set -euo pipefail
+          echo "probing ${ORIGIN}"
+          # The same two checks the deployment uses once the origin is live: a
+          # healthy API (which proves Payload initialized and reached
+          # PostgreSQL) and a renderable home page (which proves the proxy
+          # forwards more than /api).
+          curl --fail --show-error --silent --location \
+            "${ORIGIN}/api/health" | tee /dev/stderr | grep -q '"status":"ok"'
+          curl --fail --show-error --silent --output /dev/null "${ORIGIN}/"
+
+      - name: Report
+        if: always()
+        env:
+          ORIGIN: ${{ vars.PRODUCTION_SERVER_URL }}
+          PROBED: ${{ steps.gate.outputs.probe }}
+          RESULT: ${{ steps.smoke.outcome }}
+          PUBLIC_READY: ${{ vars.PRODUCTION_PUBLIC_READY }}
+        run: |
+          {
+            echo "### Production public origin"
+            echo ""
+            echo "- origin: \`${ORIGIN}\`"
+            echo "- \`PRODUCTION_PUBLIC_READY\`: \`${PUBLIC_READY:-<unset>}\`"
+            echo "- probe: \`${RESULT:-skipped}\`"
+            echo ""
+            if [ "$PROBED" != "true" ]; then
+              echo "Not probed. The origin is not expected to be public yet, so a scheduled"
+              echo "run reports nothing rather than failing. Dispatch this workflow manually"
+              echo "to check whether the DNS/TLS cutover has landed."
+            elif [ "$RESULT" = "success" ]; then
+              echo "**PRODUCTION LIVE.** The public origin serves the running release."
+              echo ""
+              if [ "$PUBLIC_READY" != "true" ]; then
+                echo "> Set repository variable \`PRODUCTION_PUBLIC_READY=true\` so every later"
+                echo "> deployment includes this probe in its own gate again."
+              fi
+            else
+              echo "**NOT SERVING PUBLICLY.** The application on the VPS is unaffected by this"
+              echo "workflow — it changes nothing — so this is a DNS, reverse-proxy, TLS or"
+              echo "firewall problem far more often than an application one. Check the"
+              echo "cPanel/Apache vhost and error log, the certificate, and CSF."
+              echo ""
+              echo "> Do NOT redeploy to 'fix' this. Redeploying opens a maintenance window"
+              echo "> and changes the database; it cannot change a DNS record."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

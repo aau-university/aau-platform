@@ -1,0 +1,137 @@
+# cPanel-managed Apache reverse proxy for the AAU platform.
+#
+# ═══════════════════════════════════════════════════════════════════════════
+#  THIS IS A REFERENCE, NOT A FILE TO COPY OVER httpd.conf
+# ═══════════════════════════════════════════════════════════════════════════
+# The audited host runs cPanel/WHM with Apache 2.4.68 owning ports 80 and 443.
+# cPanel GENERATES /etc/apache2/conf/httpd.conf from its own templates and
+# rebuilds it on account changes, SSL renewals, EasyApache updates and more.
+# Anything written directly into that file is lost, silently, at the worst
+# possible moment.
+#
+# The supported integration surface is cPanel's per-vhost include directories.
+# Place this content in the include that matches the account and vhost, then
+# have cPanel rebuild and restart:
+#
+#   # SSL (443) vhost include for one user's one domain:
+#   /etc/apache2/conf.d/userdata/ssl/2_4/<cpanel-user>/<domain>/aau-proxy.conf
+#   # plain HTTP (80) equivalent, if anything is needed there at all:
+#   /etc/apache2/conf.d/userdata/std/2_4/<cpanel-user>/<domain>/aau-proxy.conf
+#
+#   /usr/local/cpanel/scripts/ensure_vhost_includes --user=<cpanel-user>
+#   /scripts/rebuildhttpdconf && /scripts/restartsrv_httpd
+#
+# Confirm the exact paths against the cPanel version on the host before
+# writing anything: they are version-specific, and this repository cannot
+# verify them. PENDING REAL VPS.
+#
+# ── Scope: this must capture ONE vhost, not the server ────────────────────
+# The host also serves mail and cPanel's own interfaces. A proxy rule placed at
+# server scope, or a `ProxyPass /` in a shared include, would capture:
+#
+#   mail.<domain>        webmail.<domain>      cpanel.<domain>
+#   whm.<domain>         autodiscover.<domain> autoconfig.<domain>
+#   cpcalendars.<domain> cpcontacts.<domain>
+#   /cpanel /webmail /whm  proxy subdomains and their alias paths
+#   /.well-known/acme-challenge  (AutoSSL renewal — breaking this breaks TLS)
+#
+# Breaking any of those breaks mail, webmail, or certificate renewal for the
+# whole account. Using a per-user, per-domain userdata include is what keeps
+# the rule scoped to exactly one vhost, and the exclusions below are defence in
+# depth on top of that.
+#
+# ── Routing model ─────────────────────────────────────────────────────────
+#   public HTTPS name -> CSF -> cPanel Apache :443 -> this proxy -> 127.0.0.1
+#
+#   production  ->  127.0.0.1:3000
+#   staging     ->  127.0.0.1:13000
+#
+# The application ports are bound to loopback only and are never publicly
+# reachable. That is a Docker binding, not a firewall: CSF must still deny
+# 3000/3001/13000/13001 from the outside, and that has to be verified ON THE
+# HOST. PENDING REAL VPS.
+
+# ── Never proxy these ─────────────────────────────────────────────────────
+# ACME first: if AutoSSL cannot answer a challenge, the certificate expires and
+# the site goes down in a way that looks like an application failure.
+ProxyPass        /.well-known/acme-challenge  !
+ProxyPass        /cpanel                      !
+ProxyPass        /webmail                     !
+ProxyPass        /whm                         !
+ProxyPass        /cpcalendars                 !
+ProxyPass        /cpcontacts                  !
+ProxyPass        /autodiscover                !
+ProxyPass        /autoconfig                  !
+
+# ── The application ───────────────────────────────────────────────────────
+# `nocanon` passes the raw, un-normalised path through. Payload's admin and
+# REST routes carry encoded characters in IDs and query values, and Apache's
+# canonicalisation would rewrite them.
+ProxyPreserveHost On
+ProxyPass        /  http://127.0.0.1:3000/  nocanon retry=0 timeout=120 connectiontimeout=5
+ProxyPassReverse /  http://127.0.0.1:3000/
+
+# ── Forwarding headers ────────────────────────────────────────────────────
+# The application resolves its own public origin from the origin baked into the
+# image at build time, so it does not DEPEND on these — but they must still be
+# correct, or client IPs in logs and rate limiting are wrong, and anything that
+# inspects the scheme sees plain HTTP.
+#
+# X-Forwarded-For and X-Forwarded-Host are set by mod_proxy_http itself.
+RequestHeader set X-Forwarded-Proto "https"
+RequestHeader set X-Forwarded-Port  "443"
+
+# ── Request-body handling to the backend ─────────────────────────────────
+# CAREFUL: these mod_proxy variables are PRESENCE-activated, not value-
+# activated. The Apache documentation is explicit — "environment variables that
+# don't specify specific values are enabled when set to any value" — so
+# `SetEnv proxy-nokeepalive 0` does NOT disable it. It ENABLES it, closing the
+# backend connection after every request, which is the opposite of what a "0"
+# reads as. That line used to be here and has been removed rather than
+# corrected: keepalive to the backend is the Apache default and needs no
+# directive at all.
+#
+# `proxy-sendchunked` governs how the REQUEST BODY is forwarded upstream: it
+# lets a chunked request be streamed to the backend instead of being spooled to
+# disk to compute a Content-Length. That matters for large admin media uploads.
+# It has nothing to do with how RESPONSES are streamed to the client, which is
+# what an earlier comment here claimed — Next.js RSC streaming is unaffected by
+# it either way.
+SetEnv proxy-sendchunked 1
+
+# ── Timeouts ──────────────────────────────────────────────────────────────
+# `timeout=120` above covers a slow first render or a large upload. It must be
+# LONGER than the application's own request handling and SHORTER than any
+# client-facing idle timeout, or a request that is still being served is cut off
+# by the proxy and reported as a 502 that the application logs know nothing
+# about.
+
+# ── Upload size ───────────────────────────────────────────────────────────
+# Payload accepts media uploads. Apache's LimitRequestBody defaults vary by
+# cPanel configuration; set it deliberately rather than discovering the limit
+# from a user's failed upload. 64 MiB, matching the nginx reference.
+LimitRequestBody 67108864
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  STAGING
+# ═══════════════════════════════════════════════════════════════════════════
+# Identical, in the staging domain's own userdata include, pointing at 13000:
+#
+#   ProxyPass        /  http://127.0.0.1:13000/  nocanon retry=0 timeout=120
+#   ProxyPassReverse /  http://127.0.0.1:13000/
+#
+# Staging must have its OWN hostname. The public origin is baked into the image
+# and drives CORS, CSRF and cookie scope, so serving staging from a production
+# hostname would issue cookies for the production domain.
+#
+# ── Internal testing before DNS and TLS exist ─────────────────────────────
+# The operator can reach staging on 127.0.0.1:13000 over an SSH tunnel before
+# any of this is wired. That is an INFRASTRUCTURE smoke test — container health,
+# database, Redis, migrations, persistence — and it is not equivalent to real
+# staging.
+#
+# It cannot exercise the HTTPS origin, `Secure` cookies, CSRF, admin login,
+# streaming or uploads through the proxy, because those depend on a real HTTPS
+# origin. Do NOT relax the production origin rules to make an HTTP tunnel behave
+# like public staging: that would weaken the exact control the tunnel cannot
+# test. See deploy/STAGING_VPS_CONTRACT.md, "Two distinct test phases".

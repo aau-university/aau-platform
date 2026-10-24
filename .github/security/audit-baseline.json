@@ -1,0 +1,79 @@
+{
+  "note": "Baseline of high/critical advisories ALREADY present in the dependency tree when the dependency gate was introduced. The gate fails on anything NOT listed here, so a change that introduces a NEW vulnerability is blocked, while pre-existing debt does not make the gate red on day one and train everyone to ignore it. These are not exemptions: each is debt with a review date. Most sit behind Payload and Next and need a deliberate, separately validated dependency upgrade — see deploy/ACCEPTANCE.md. Pruned 2026-09-15: the Next 16.3.5 / sharp 0.35.4 upgrade and the browserslist / fast-uri / js-yaml overrides resolved seven of these outright, and the gate fails on a baseline entry that is no longer present precisely so this list cannot rot into a permanent exemption.",
+  "recorded_at": "2026-09-15",
+  "review_by": "2026-12-15",
+  "advisories": {
+    "GHSA-28wg-ghj8-5hjv": {
+      "module": "nanoid",
+      "severity": "high",
+      "patched": ">=3.3.16",
+      "title": "nanoid: non-secure generators can loop indefinitely with negative size"
+    },
+    "GHSA-2v37-7h3g-55p8": {
+      "module": "nanoid",
+      "severity": "high",
+      "patched": ">=3.3.18",
+      "title": "nanoid: custom generators can loop indefinitely when size is zero"
+    },
+    "GHSA-3jxr-9vmj-r5cp": {
+      "module": "brace-expansion",
+      "severity": "high",
+      "patched": ">=5.0.7",
+      "title": "brace-expansion: DoS via exponential-time expansion of consecutive non-expanding {} groups"
+    },
+    "GHSA-4cwx-7wf7-3272": {
+      "module": "undici",
+      "severity": "high",
+      "patched": ">=7.29.0",
+      "title": "undici vulnerable to cross-user information disclosure and parse-time crash via degenerate private cache direc"
+    },
+    "GHSA-5p2g-fcmc-qvqq": {
+      "module": "image-size",
+      "severity": "high",
+      "patched": "<0.0.0",
+      "title": "image-size: JXL and HEIF parsers allow denial of service through infinite loops"
+    },
+    "GHSA-fjxv-7rqg-78g4": {
+      "module": "form-data",
+      "severity": "critical",
+      "patched": ">=4.0.4",
+      "title": "form-data uses unsafe random function in form-data for choosing boundary"
+    },
+    "GHSA-hmw2-7cc7-3qxx": {
+      "module": "form-data",
+      "severity": "high",
+      "patched": ">=4.0.6",
+      "title": "form-data: CRLF injection in form-data via unescaped multipart field names and filenames"
+    },
+    "GHSA-mh99-v99m-4gvg": {
+      "module": "brace-expansion",
+      "severity": "high",
+      "patched": ">=5.0.8",
+      "title": "brace-expansion: DoS via unbounded expansion length causing an out-of-memory process crash"
+    },
+    "GHSA-rgw5-rvv9-x895": {
+      "module": "brace-expansion",
+      "severity": "high",
+      "patched": ">=5.0.9",
+      "title": "brace-expansion: DoS via unbounded intermediate arrays, bypassing the CVE-2026-14257 mitigation"
+    },
+    "GHSA-v56q-mh7h-f735": {
+      "module": "immutable",
+      "severity": "high",
+      "patched": ">=4.3.9",
+      "title": "Immutable.js `List` 32-bit trie overflow → unrecoverable DoS"
+    },
+    "GHSA-w3rx-r6r6-pgpr": {
+      "module": "image-size",
+      "severity": "high",
+      "patched": "<0.0.0",
+      "title": "image-size: ICNS parser allows denial of service through an infinite loop"
+    },
+    "GHSA-xvcm-6775-5m9r": {
+      "module": "immutable",
+      "severity": "high",
+      "patched": ">=4.3.9",
+      "title": "Immutable: Hash-collision algorithmic complexity denial of service in Immutable.Map/Set"
+    }
+  }
+}

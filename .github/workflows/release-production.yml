@@ -1,0 +1,236 @@
+name: Prepare production release
+
+# Produces ONE immutable production artifact from an approved commit, and stops.
+#
+# ── Why preparation is separate from deployment ───────────────────────────
+# The VPS authorizes releases consumer-side: `deploy-entrypoint.sh` reads a
+# root-owned release policy, and in its strong mode that policy is an allow-list
+# of exact digests an operator has recorded. A digest cannot be recorded before
+# it exists, so a single workflow that built and then immediately cut over could
+# never succeed against that policy — the cutover would be refused, and the only
+# way to retry would be to run it again, which REBUILDS. The image is not
+# bit-reproducible (base-image updates, `apt-get upgrade`, timestamps), so the
+# retry produces a DIFFERENT digest, which is again not on the allow-list. The
+# loop never terminates.
+#
+# Splitting the two fixes that, and it also gives the invariant that matters
+# more: the artifact that was gated, inspected and authorized is byte-for-byte
+# the artifact that is deployed. `deploy-production.yml` takes a digest and
+# never builds.
+#
+#   approved main commit
+#     -> exact release gate
+#     -> build once, publish once            <- THIS WORKFLOW
+#     -> immutable image@sha256
+#     -> operator records that digest on the host
+#     -> deploy that exact digest            <- deploy-production.yml
+#
+# ── Approval precedes PUBLICATION ─────────────────────────────────────────
+# A production-channel image in GHCR is itself a release artifact: the VPS
+# entrypoint accepts that package and no other. So the `production` Environment
+# gate and the typed confirmation are checked BEFORE the build job runs — an
+# unauthorized or mistyped dispatch publishes NOTHING.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Exact release SHA or tag to publish (must be contained in PRODUCTION_RELEASE_REF)'
+        type: string
+        required: true
+      confirm:
+        description: 'Type PUBLISH to confirm creating a real production artifact'
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  # Preparing two production artifacts at once is never intentional, and the
+  # second would silently become "the" release in whatever the operator pastes
+  # next. Queue, never cancel.
+  group: production-release
+  cancel-in-progress: false
+
+jobs:
+  # ── 0. Pin the release to ONE immutable commit, and authorize its lineage ─
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.pin.outputs.sha }}
+      authorized: ${{ steps.authorize.outputs.authorized }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+      - id: pin
+        # `${{ }}` is substituted before bash parses this script, so a dispatch
+        # input is shell source unless it arrives through the environment.
+        env:
+          REQUESTED_REF: ${{ inputs.ref }}
+        run: |
+          sha="$(git rev-parse HEAD)"
+          case "$sha" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
+            *) echo "::error::could not resolve '${REQUESTED_REF}' to a commit SHA" >&2; exit 1 ;;
+          esac
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "Pinned '${REQUESTED_REF}' to ${sha}"
+
+      # ── Release lineage authorization ────────────────────────────────────
+      # Resolving an arbitrary `inputs.ref` to an immutable SHA proves only
+      # WHICH commit, never that the commit is an APPROVED release.
+      #
+      # A GitHub Environment's branch/tag protection rule restricts the ref the
+      # WORKFLOW RUN was started from — it does not inspect a custom `ref`
+      # input, so it cannot authorize this. The check is therefore explicit:
+      # the resolved commit must be contained in the release ref's history.
+      - name: Authorize the resolved SHA against the release lineage
+        id: authorize
+        env:
+          RELEASE_REF: ${{ vars.PRODUCTION_RELEASE_REF }}
+        run: |
+          sha="${{ steps.pin.outputs.sha }}"
+
+          if [ -z "$RELEASE_REF" ]; then
+            echo "authorized=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::PRODUCTION_RELEASE_REF is not configured, so release lineage cannot be verified. Publication will not be authorized."
+            exit 0
+          fi
+
+          # The lineage ref must be FETCHED, not merely present. With `|| true`
+          # on both fetches, a network or authorization failure fell through to
+          # whatever `actions/checkout` had already fetched, and the
+          # containment test below would then authorize this commit against a
+          # stale ref. Which ref answered is recorded here rather than
+          # re-derived, so the ref fetched is the ref checked.
+          target=""
+          if git fetch --quiet --no-tags origin \
+               "+refs/heads/${RELEASE_REF}:refs/remotes/origin/${RELEASE_REF}" 2>/dev/null; then
+            target="refs/remotes/origin/${RELEASE_REF}"
+          elif git fetch --quiet origin \
+               "+refs/tags/${RELEASE_REF}:refs/tags/${RELEASE_REF}" 2>/dev/null; then
+            target="refs/tags/${RELEASE_REF}"
+          else
+            echo "::error::could not fetch PRODUCTION_RELEASE_REF '${RELEASE_REF}' as a branch or a tag." >&2
+            echo "::error::Refusing to authorize against a possibly stale local ref." >&2
+            exit 1
+          fi
+
+          # `merge-base --is-ancestor` is the containment test: it succeeds only
+          # when the commit is genuinely part of the release ref's history.
+          if git merge-base --is-ancestor "$sha" "$target"; then
+            echo "authorized=true" >> "$GITHUB_OUTPUT"
+            echo "${sha} is contained in ${RELEASE_REF} — authorized for production"
+          else
+            echo "::error::${sha} is NOT contained in the release ref '${RELEASE_REF}'." >&2
+            echo "::error::Only commits merged into the approved release ref may be published." >&2
+            exit 1
+          fi
+
+  # ── 1. Validate the exact SHA being published ───────────────────────────
+  release-gate:
+    needs: resolve
+    uses: ./.github/workflows/release-gate.yml
+    with:
+      ref: ${{ needs.resolve.outputs.sha }}
+
+  # ── 2. AUTHORIZE — before anything is published ─────────────────────────
+  authorize:
+    needs: [resolve, release-gate]
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    steps:
+      - name: Verify the operator typed the exact confirmation
+        if: inputs.confirm != 'PUBLISH'
+        run: |
+          echo "::error::confirm input must be exactly 'PUBLISH'; nothing has been published." >&2
+          exit 1
+
+      - name: Refuse an unauthorized commit
+        if: needs.resolve.outputs.authorized != 'true'
+        run: |
+          echo "::error::the resolved SHA was not authorized against a release lineage." >&2
+          echo "::error::Set repository variable PRODUCTION_RELEASE_REF to the approved" >&2
+          echo "::error::release branch or tag (normally 'main') before publishing." >&2
+          exit 1
+
+      - name: Require the real production origin
+        # `NEXT_PUBLIC_SERVER_URL` is inlined by `next build`, so the origin is
+        # part of the artifact's identity. The production image is built for the
+        # university's canonical origin even while DNS still points elsewhere —
+        # a localhost-origin image would have to be rebuilt at cutover, which is
+        # precisely the rebuild this split exists to prevent.
+        if: vars.PRODUCTION_SERVER_URL == ''
+        run: |
+          echo "::error::PRODUCTION_SERVER_URL is not set. It is baked into the image at" >&2
+          echo "::error::build time, so it must be the real university origin (https://aau.edu.ye)." >&2
+          exit 1
+
+      - name: Record the authorization
+        env:
+          REQUESTED_REF: ${{ inputs.ref }}
+          PINNED_SHA: ${{ needs.resolve.outputs.sha }}
+          RELEASE_REF: ${{ vars.PRODUCTION_RELEASE_REF }}
+          BAKED_ORIGIN: ${{ vars.PRODUCTION_SERVER_URL }}
+        run: |
+          {
+            echo "### Authorized for publication"
+            echo "- requested ref: \`${REQUESTED_REF}\`"
+            echo "- pinned SHA: \`${PINNED_SHA}\`"
+            echo "- release lineage: \`${RELEASE_REF}\`"
+            echo "- baked origin: \`${BAKED_ORIGIN}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── 3. Build and publish that exact SHA once ────────────────────────────
+  build:
+    needs: [resolve, release-gate, authorize]
+    uses: ./.github/workflows/build-publish.yml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    with:
+      ref: ${{ needs.resolve.outputs.sha }}
+      publish: true
+      channel: production
+      server_url: ${{ vars.PRODUCTION_SERVER_URL }}
+
+  # ── 4. Hand the operator the exact next step ────────────────────────────
+  record:
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report the immutable release identity
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          {
+            echo "### Production release prepared"
+            echo ""
+            echo "- commit: \`${SHA}\`"
+            echo "- artifact: \`${IMAGE}@${DIGEST}\`"
+            echo ""
+            echo "Nothing has been deployed. This artifact is now the only thing that"
+            echo "may be. To authorize it on the host, append the digest to the"
+            echo "root-owned allow-list named by the production release policy:"
+            echo ""
+            echo '```'
+            echo "# on the VPS, as root"
+            echo "echo '${DIGEST}' >> /srv/aau/production/deploy/authorized-releases"
+            echo '```'
+            echo ""
+            echo "Then run **Deploy production release** with:"
+            echo ""
+            echo "- \`digest\`: \`${DIGEST}\`"
+            echo "- \`confirm\`: \`DEPLOY\`"
+            echo ""
+            echo "The deployment workflow does not build. It deploys this exact digest"
+            echo "or nothing."
+          } >> "$GITHUB_STEP_SUMMARY"
