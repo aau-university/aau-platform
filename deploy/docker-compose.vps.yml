@@ -151,7 +151,7 @@ services:
     pids_limit: ${POSTGRES_PIDS_LIMIT:-512}
 
   redis-prod:
-    image: redis:8.8.2-trixie@sha256:2b42a93631132be6df7a31f843b91ea8a907011e955b03395b7edbb13a20a99d
+    image: redis:8.10.1-trixie@sha256:8a1efc5f479551822b47424ccae982026b633f28818eab0387348120a61e10e2
     restart: unless-stopped
     logging: *logging
     environment:
