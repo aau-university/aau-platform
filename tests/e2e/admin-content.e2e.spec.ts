@@ -177,10 +177,9 @@ test.describe('Admin renders real content for every versioned entity', () => {
     })
   }
 
-  test('the backfilled version is visible in the Admin versions view', async () => {
-    // The point of the canonical version is that an editor can see and roll
-    // back to it. A row in the database that the Versions view does not list
-    // is not the outcome this migration is for.
+  test('the document history is visible in the Admin versions view', async () => {
+    // An editor must be able to see and roll back to a version. A row in the
+    // database that the Versions view does not list is not useful history.
     const { docs } = await payload.find({
       collection: 'colleges',
       limit: 1,
@@ -194,13 +193,15 @@ test.describe('Admin renders real content for every versioned entity', () => {
     await expect(page.locator('h1, h2').first()).toBeVisible()
     await expectNoDataFailure(page)
 
-    // Exactly one canonical version, and it is the one the backfill wrote.
+    // The fixture is created normally (create + second-locale update), so it
+    // carries real version history; the Neon backfill that used to leave
+    // exactly one canonical version was removed.
     const versions = await payload.countVersions({
       collection: 'colleges',
       overrideAccess: true,
       where: { parent: { equals: college!.id } },
     })
-    expect(versions.totalDocs).toBe(1)
+    expect(versions.totalDocs).toBeGreaterThanOrEqual(1)
   })
 
   test('localized content survives the backfill and renders in the Admin', async () => {
