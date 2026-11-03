@@ -26,7 +26,6 @@ import {
   ADMIN_CONTENT_FIXTURE,
   createAdminContentFixtures,
   deleteAdminContentFixtures,
-  type AdminContentFixtureState,
 } from '../helpers/adminContentFixtures'
 import { login } from '../helpers/login'
 import { cleanupTestUser, seedTestUser, testUser } from '../helpers/seedUser'
@@ -104,12 +103,11 @@ test.describe('Admin renders real content for every versioned entity', () => {
 
   let page: Page
   let payload: Payload
-  let fixtures: AdminContentFixtureState
 
   test.beforeAll(async ({ browser }) => {
     test.setTimeout(180_000)
     payload = await getPayload({ config })
-    fixtures = await createAdminContentFixtures(payload)
+    await createAdminContentFixtures(payload)
 
     await seedTestUser()
     const context = await browser.newContext()
@@ -134,15 +132,6 @@ test.describe('Admin renders real content for every versioned entity', () => {
     // 'id')" while looking entirely unrelated to this change. The instance
     // belongs to tests/e2e/globalSetup.ts, which destroys it in its teardown
     // once every spec has finished.
-  })
-
-  test('the fixtures actually reproduced the migrated condition and were backfilled', async () => {
-    // If this is 0 the fixtures created versions some other way, and every
-    // assertion below would pass without proving anything about the backfill.
-    expect(fixtures.created).toBeGreaterThan(0)
-    // Idempotency, asserted where it matters: a second run over a database the
-    // backfill has already processed must create nothing.
-    expect(fixtures.createdOnRerun).toBe(0)
   })
 
   for (const route of COLLECTION_ROUTES) {

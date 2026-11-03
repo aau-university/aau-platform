@@ -36,7 +36,7 @@ concurrency:
 
 jobs:
   probe:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Require a configured production origin
         # Not on a pre-cutover SCHEDULED run: before DNS exists neither variable

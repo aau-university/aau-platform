@@ -15,7 +15,6 @@ describe('release and production deployment contracts', () => {
       'pnpm typecheck',
       'pnpm test:unit',
       'pnpm test:int',
-      'pnpm test:seed',
       'pnpm verify:generated',
       'pnpm build',
       'pnpm exec playwright install --with-deps chromium',
@@ -27,15 +26,18 @@ describe('release and production deployment contracts', () => {
       expect(workflow).toContain(required)
     }
     expect(workflow).not.toContain('RUN_DB_INTEGRATION_TESTS')
-    expect(workflow).toContain('node scripts/assert-seed-summary.mjs seed-second-run.log')
+    // The canonical Seed and the Neon import tooling were removed: no gate
+    // may still reach for them.
+    for (const removed of ['test:seed', 'seed-one-shot', 'canonical-seed', 'tests/migration/', 'neon-']) {
+      expect(workflow).not.toContain(removed)
+    }
     expect(workflow).not.toContain("grep -q 'created.*0'")
   })
 
-  it('keeps bootstrap provisioning outside normal production startup', () => {
+  it('runs the production identity bootstrap in app-prod, and no Seed', () => {
     const compose = read('docker-compose.prod.yml')
     for (const required of [
       'migrate-prod:',
-      'canonical-seed-source-build:',
       'app-prod:',
       "command: ['pnpm', 'payload', 'migrate']",
       'service_completed_successfully',
@@ -47,26 +49,13 @@ describe('release and production deployment contracts', () => {
     ]) {
       expect(compose).toContain(required)
     }
-    // Renamed from `seed-bootstrap-prod`: it runs `pnpm seed`, the BROAD
-    // canonical Seed, not the minimal identity bootstrap the VPS performs at
-    // startup. Those have very different blast radii, and a name that blurs
-    // them is how someone eventually runs the wrong one against production.
-    expect(compose).toContain("profiles: ['canonical-seed']")
-    expect(compose).toMatch(
-      /canonical-seed-source-build:[\s\S]*INITIAL_ADMIN_EMAIL:[\s\S]*INITIAL_ADMIN_PASSWORD:/,
-    )
-    const migrateService = compose
-      .split('  migrate-prod:')[1]
-      .split('  canonical-seed-source-build:')[0]
-    const bootstrapService = compose
-      .split('  canonical-seed-source-build:')[1]
-      .split('  app-prod:')[0]
+    const migrateService = compose.split('  migrate-prod:')[1].split('  app-prod:')[0]
     const appService = compose.split('  app-prod:')[1].split('\nvolumes:')[0]
-    expect(bootstrapService).toContain('INITIAL_ADMIN_EMAIL:')
-    expect(bootstrapService).toContain('INITIAL_ADMIN_PASSWORD:')
+    // The same create-missing-only bootstrap the VPS runtime performs.
+    expect(appService).toContain("PAYLOAD_RUNTIME_BOOTSTRAP: 'true'")
+    expect(appService).toContain('INITIAL_ADMIN_EMAIL:')
     expect(migrateService).not.toContain('INITIAL_ADMIN_')
-    expect(appService).not.toContain('INITIAL_ADMIN_')
-    expect(appService).not.toContain('canonical-seed-source-build:')
+    expect(compose).not.toMatch(/canonical-seed|pnpm['"]?,\s*['"]seed|command:.*seed/)
   })
 
   it('keeps migrations in an operations image and the app in standalone runner', () => {
@@ -147,21 +136,10 @@ describe('release and production deployment contracts', () => {
     expect(normalRedeploy).toContain('versions_before=')
     expect(normalRedeploy).toContain('test "$core_after" = "$core_before"')
     expect(normalRedeploy).toContain('test "$versions_after" = "$versions_before"')
-    expect(normalRedeploy).toContain('test "$seed_logs_before" = "0"')
-    expect(normalRedeploy).toContain('test "$seed_logs_after" = "0"')
-    expect(normalRedeploy).not.toContain('seed-bootstrap-prod')
-    expect(normalRedeploy).not.toContain('INITIAL_ADMIN_')
-  })
-
-  it('compares every root version table during the second bootstrap run', () => {
-    const workflow = read('.github/workflows/release-gate.yml')
-    const idempotency = workflow
-      .split('- name: Verify explicit bootstrap idempotency and version stability')[1]
-      .split('- name: Verify normal redeploy preserves dynamic Role state')[0]
-
-    expect(idempotency).toContain('snapshot_version_counts')
-    expect(idempotency).toContain("tablename ~ '^_.*_v$'")
-    expect(idempotency).toContain('test "$versions_after" = "$versions_before"')
-    expect(idempotency).not.toContain('select count(*) from _pages_v')
+    expect(normalRedeploy).toContain("tablename ~ '^_.*_v$'")
+    // Email only: the redeploy validates the existing Super Admin without the
+    // bootstrap password, as on the VPS once that password is retired.
+    expect(normalRedeploy).toContain('INITIAL_ADMIN_EMAIL:')
+    expect(normalRedeploy).not.toContain('INITIAL_ADMIN_PASSWORD')
   })
 })

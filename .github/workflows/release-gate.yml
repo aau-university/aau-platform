@@ -32,7 +32,7 @@ env:
 
 jobs:
   quality:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -79,40 +79,6 @@ jobs:
       # widened owner/package. Docker stub, no registry.
       - name: GHCR channel and pre-migration recovery drill
         run: bash tests/deploy/image-channel-drill.sh
-      # The Neon -> VPS migration tooling's fail-closed contract: the
-      # staging-only guard, the export integrity envelope, the Public Media
-      # scope (Private Media binaries stay out), and an unmeasurable value
-      # never reading as a match. No Docker, so it belongs here with the other
-      # host-script drills.
-      - name: Neon migration fail-closed drill
-        run: bash tests/migration/neon-migration-contract-drill.sh
-
-      # Fault injection for the one window in the import where staging can be
-      # left without its application database: the moment between the two
-      # promotion renames. Drives the real state machine with a rename that
-      # fails on demand.
-      - name: Neon promotion fault-injection drill
-        run: bash tests/migration/neon-promotion-drill.sh
-
-      # Regression for the failure the first real Staging rehearsal hit: the
-      # Neon archive contains `CREATE SCHEMA public`, and a freshly created
-      # scratch database already has one, so `pg_restore --exit-on-error` died
-      # on "schema already exists". Runs against a REAL server (the runner's
-      # PostgreSQL, else the pinned 18.6 image) because every part of that bug
-      # is server behaviour a source-text assertion would sail past.
-      - name: Neon scratch-restore regression drill
-        run: bash tests/migration/neon-scratch-restore-drill.sh
-
-      # Regression for the defect the 2026-09-14 live Staging diagnosis found:
-      # the schema upgrade ran over the ADMIN connection, so every object it
-      # created was owned by aau_admin while the application connects as
-      # aau_app — and Payload's Admin died with SQLSTATE 42501 on version
-      # tables that every schema count said were present and correct. Real
-      # server, and mutation-checked: the old execution model must still
-      # reproduce `permission denied`.
-      - name: Neon object-ownership regression drill
-        run: bash tests/migration/neon-object-ownership-drill.sh
-
       - name: Security-gate semantics drills
         # These prove the release gate's own failure paths. Both scanners
         # previously reported success while the condition they guard was
@@ -122,7 +88,7 @@ jobs:
           bash tests/security/image-secret-scan-drill.sh
 
   integration:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -136,10 +102,9 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm test:int
-      - run: pnpm test:seed
 
   generated-and-build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -168,7 +133,7 @@ jobs:
       - run: pnpm build
 
   browser:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     services:
       postgres:
         image: postgres:18.6-bookworm
@@ -221,7 +186,7 @@ jobs:
           if-no-files-found: ignore
 
   docker:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       DATABASE_URI: postgresql://payload:payload@postgres-prod:5432/aau_platform
       DATABASE_DIRECT_URI: postgresql://payload:payload@postgres-prod:5432/aau_platform
@@ -236,7 +201,7 @@ jobs:
           ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
       - name: Build development image
         run: docker build --target dev -t aau-payload-platform:dev .
-      - name: Build production and execute explicit first-install bootstrap
+      - name: Build production and execute the first-install identity bootstrap
         env:
           INITIAL_ADMIN_EMAIL: admin@example.test
           INITIAL_ADMIN_PASSWORD: CI-Initial-Admin-Password-2026!
@@ -245,34 +210,18 @@ jobs:
           docker compose -f docker-compose.prod.yml -p "$project" build
           docker compose -f docker-compose.prod.yml -p "$project" up --detach --wait postgres-prod redis-prod
           docker compose -f docker-compose.prod.yml -p "$project" run --rm migrate-prod
-          docker compose -f docker-compose.prod.yml -p "$project" --profile canonical-seed run --rm --no-deps canonical-seed-source-build
           docker compose -f docker-compose.prod.yml -p "$project" up --detach --no-deps --wait app-prod
       - name: Verify public and health endpoints
         run: |
           curl --fail --show-error http://127.0.0.1:3000/api/health
           curl --fail --show-error http://127.0.0.1:3000/
-      - name: Verify explicit bootstrap idempotency and version stability
+      - name: Verify normal redeploy preserves dynamic Role state
+        # app-prod re-runs the identity bootstrap on every start; it must be
+        # create-missing-only, so a redeploy changes no Role, user or version row.
+        # Email only, no bootstrap password: the VPS steady state after the
+        # password is retired, where the existing Super Admin is only validated.
         env:
           INITIAL_ADMIN_EMAIL: admin@example.test
-          INITIAL_ADMIN_PASSWORD: CI-Initial-Admin-Password-2026!
-        run: |
-          project=aau-pr25-${{ github.run_id }}
-          compose=(docker compose -f docker-compose.prod.yml -p "$project")
-          snapshot_version_counts() {
-            "${compose[@]}" exec -T postgres-prod psql -U payload -d aau_platform -At <<'SQL'
-          SELECT format('SELECT %L || ''='' || count(*) FROM %I;', tablename, tablename)
-          FROM pg_tables
-          WHERE schemaname = 'public' AND tablename ~ '^_.*_v$'
-          ORDER BY tablename
-          \gexec
-          SQL
-          }
-          versions_before=$(snapshot_version_counts)
-          "${compose[@]}" --profile canonical-seed run --rm --no-deps canonical-seed-source-build | tee seed-second-run.log
-          versions_after=$(snapshot_version_counts)
-          test "$versions_after" = "$versions_before"
-          node scripts/assert-seed-summary.mjs seed-second-run.log
-      - name: Verify normal redeploy preserves dynamic Role state
         run: |
           project=aau-pr25-${{ github.run_id }}
           compose=(docker compose -f docker-compose.prod.yml -p "$project")
@@ -292,18 +241,14 @@ jobs:
           expected=$("${compose[@]}" exec -T postgres-prod psql -U payload -d aau_platform -Atc "select can_access_refine from roles where slug = 'coordinator'")
           core_before=$(snapshot_core_counts)
           versions_before=$(snapshot_version_counts)
-          seed_logs_before=$("${compose[@]}" logs --no-color app-prod | grep -c 'Seed completed' || true)
           "${compose[@]}" run --rm migrate-prod
           "${compose[@]}" up --detach --no-deps --force-recreate --wait app-prod
           actual=$("${compose[@]}" exec -T postgres-prod psql -U payload -d aau_platform -Atc "select can_access_refine from roles where slug = 'coordinator'")
           core_after=$(snapshot_core_counts)
           versions_after=$(snapshot_version_counts)
-          seed_logs_after=$("${compose[@]}" logs --no-color app-prod | grep -c 'Seed completed' || true)
           test "$actual" = "$expected"
           test "$core_after" = "$core_before"
           test "$versions_after" = "$versions_before"
-          test "$seed_logs_before" = "0"
-          test "$seed_logs_after" = "0"
       - name: Capture Docker logs
         if: always()
         run: docker compose -f docker-compose.prod.yml -p aau-pr25-${{ github.run_id }} logs --no-color > docker-cold-start.log
@@ -321,7 +266,7 @@ jobs:
   # final runner image: no repository source is mounted, Payload applies its
   # own migrations, and the identity bootstrap is create-missing-only.
   runner-production-simulation:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -404,11 +349,6 @@ jobs:
       - name: Environment isolation drill
         run: bash tests/deploy/environment-isolation-drill.sh
 
-      # The explicit one-shot Seed, run from the source-free bundled artifact
-      # inside the real runner image.
-      - name: One-shot source-free Seed drill
-        run: bash tests/docker/seed-one-shot-drill.sh aau-runner:ci
-
       # Fault injection for the three failure windows that previously had no
       # test at all, and in two cases no implementation either.
       - name: Redis credential drill
@@ -440,7 +380,7 @@ jobs:
   # rather than a third-party action, so the scanner itself is pinned the same
   # way everything else here is.
   security:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       # Trivy 0.74.0. Pinned by digest for the same reason every other image
       # here is: a tag can be repointed.
@@ -530,7 +470,7 @@ jobs:
   release-gate:
     if: always()
     needs: [quality, integration, generated-and-build, browser, docker, runner-production-simulation, security]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Require every release job
         env:

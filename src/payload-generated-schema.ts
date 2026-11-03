@@ -532,6 +532,11 @@ export const users = pgTable(
     }),
     salt: varchar('salt'),
     hash: varchar('hash'),
+    resetPasswordRequestedAt: timestamp('reset_password_requested_at', {
+      mode: 'string',
+      withTimezone: true,
+      precision: 3,
+    }),
     loginAttempts: numeric('login_attempts', { mode: 'number' }).default(0),
     lockUntil: timestamp('lock_until', { mode: 'string', withTimezone: true, precision: 3 }),
   },
@@ -617,6 +622,7 @@ export const media = pgTable(
       onDelete: 'set null',
     }),
     prefix: varchar('prefix').default('media'),
+    _objectKey: varchar('_objectkey'),
     blurhash: varchar('blurhash'),
     updatedAt: timestamp('updated_at', { mode: 'string', withTimezone: true, precision: 3 })
       .defaultNow()
@@ -6048,6 +6054,7 @@ export const private_media = pgTable(
   {
     id: serial('id').primaryKey(),
     prefix: varchar('prefix').default('private-media'),
+    _objectKey: varchar('_objectkey'),
     updatedAt: timestamp('updated_at', { mode: 'string', withTimezone: true, precision: 3 })
       .defaultNow()
       .notNull(),

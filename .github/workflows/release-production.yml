@@ -56,7 +56,7 @@ concurrency:
 jobs:
   # ── 0. Pin the release to ONE immutable commit, and authorize its lineage ─
   resolve:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       sha: ${{ steps.pin.outputs.sha }}
       authorized: ${{ steps.authorize.outputs.authorized }}
@@ -140,7 +140,7 @@ jobs:
   # ── 2. AUTHORIZE — before anything is published ─────────────────────────
   authorize:
     needs: [resolve, release-gate]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment:
       name: production
     steps:
@@ -203,7 +203,7 @@ jobs:
   # ── 4. Hand the operator the exact next step ────────────────────────────
   record:
     needs: [resolve, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Report the immutable release identity
         env:

@@ -1,7 +1,0 @@
-export { aboutPageFixture } from './about-page'
-export { analyticsSettingsFixture } from './analytics-settings'
-export { contactSettingsFixture } from './contact-settings'
-export { footerSettingsFixture } from './footer-settings'
-export { navbarSettingsFixture } from './navbar-settings'
-export { siteSettingsFixture } from './site-settings'
-export { smartChatSettingsFixture } from './smart-chat-settings'

@@ -141,46 +141,17 @@ else
 fi
 
 echo
-echo "5. the destructive staging-only operation is refused in production"
-# Belt, braces and a third check: seed.sh, seed-entrypoint.sh and the seed
-# runner itself must each refuse production.
-#
-# This used to be `grep -q "STAGING-ONLY"` over all three files, which is a
-# grep for a string the files always contain — seed.sh carries it in its own
-# header comment at line 31. Deleting the `aau_env_is_production` refusal
-# would have left the check green. So seed.sh is now DRIVEN: both modes are
-# actually invoked with AAU_ENV=production and must exit non-zero. The refusal
-# fires before the env file or the release state is touched, which is why this
-# needs no deployed environment.
-for mode in reset-and-full full; do
-  out=""
-  status=0
-  out="$(AAU_ENV=production bash "${REPO_ROOT}/deploy/scripts/seed.sh" "$mode" 2>&1)" || status=$?
-  if (( status != 0 )) && [[ "$out" == *'STAGING-ONLY'* ]]; then
-    printf '  ok   seed.sh REFUSES %s in production (exit %d)\n' "$mode" "$status"; pass=$((pass + 1))
+echo "5. no destructive data-writing tool exists that could be pointed at production"
+# The canonical Seed and the Neon import were removed outright: environments
+# keep their data on the server and are recovered from verified backups. The
+# strongest refusal is absence, so this asserts the tools are gone.
+for removed in deploy/scripts/seed.sh deploy/scripts/seed-entrypoint.sh src/seed migration; do
+  if [[ -e "${REPO_ROOT}/${removed}" ]]; then
+    printf '  FAIL %s still exists\n' "$removed"; fail=$((fail + 1))
   else
-    printf '  FAIL seed.sh did not refuse %s in production (exit %d)\n       %s\n' \
-      "$mode" "$status" "$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)"; fail=$((fail + 1))
+    printf '  ok   %s is absent\n' "$removed"; pass=$((pass + 1))
   fi
 done
-
-# The other two cannot be driven from here — seed-entrypoint.sh runs inside the
-# runner image (tests/docker/seed-one-shot-drill.sh drives it for real), and
-# one-shot.ts is TypeScript. Anchor their text checks to the GUARD EXPRESSION
-# rather than to a phrase that also appears in prose.
-if grep -qE '^\[\[ "\$AAU_ENV" == "staging" \]\] \|\| fail' "${REPO_ROOT}/deploy/scripts/seed-entrypoint.sh"; then
-  printf '  ok   seed-entrypoint.sh gates on AAU_ENV == staging\n'; pass=$((pass + 1))
-else
-  printf '  FAIL seed-entrypoint.sh has no AAU_ENV==staging gate\n'; fail=$((fail + 1))
-fi
-if grep -q 'isProductionDeployment(' "${REPO_ROOT}/src/seed/one-shot.ts" \
-   && grep -q 'if (!isProduction) return' "${REPO_ROOT}/src/seed/one-shot.ts"; then
-  printf '  ok   one-shot.ts measures the deployment and returns early only when it is not production\n'
-  pass=$((pass + 1))
-else
-  printf '  FAIL one-shot.ts has no isProductionDeployment gate in assertSeedAllowed\n'
-  fail=$((fail + 1))
-fi
 
 echo
 echo "6. the example env files do not share credentials"

@@ -47,88 +47,18 @@ for forbidden in /app/src /app/.git /app/tests /app/plans /app/docs /app/scripts
   fi
 done
 
-# ── The one-shot Seed artifact ────────────────────────────────────────────
-# The canonical Seed ships as a single bundled `.mjs`, not as a source tree plus
-# a TypeScript loader. That is what lets the VPS run an explicit full Seed
-# without ever receiving the source-containing `operations` image.
-if docker run --rm --entrypoint sh "$IMAGE" -c 'test -f /app/seed-runner.mjs'; then
-  pass "the one-shot Seed artifact is present"
-else
-  fail "the runner image does not contain /app/seed-runner.mjs"
-fi
-
-# It must be COMPILED, and must not have dragged the source tree in with it: an
-# import of a `.ts` path would mean the bundle is not self-contained.
-if docker run --rm --entrypoint sh "$IMAGE" -c \
-    'grep -qE "from .[^\"'"'"']*\.ts.|require\(.[^\"'"'"']*\.ts.\)" /app/seed-runner.mjs'; then
-  fail "the seed artifact still imports TypeScript sources"
-else
-  pass "the seed artifact imports no TypeScript source"
-fi
-
-# It must actually LOAD in the image, resolving its externals from the
-# standalone node_modules. Running it with no --mode makes it fail at argument
-# parsing, which proves the whole module graph loaded without touching a
-# database. A missing-dependency failure looks completely different.
-#
-# This also proves the entry-point guard in one-shot.ts still fires after
-# esbuild bundling. If it did not, the seed would load, do nothing, and exit 0
-# — an operator would see a clean run and an unseeded database.
-# The STATUS is captured as well as the output. The contract is that a missing
-# --mode makes the runner FAIL, and a bundle that printed the usage text and
-# then exited 0 would satisfy an output-only check while silently doing nothing
-# — which is the failure this probe exists to catch. `|| var=$?` is the
-# set -e-safe idiom: `set -e` is suspended for the left operand of `||`.
-seed_status=0
-seed_probe="$(docker run --rm --entrypoint node "$IMAGE" /app/seed-runner.mjs 2>&1)" || seed_status=$?
-case "$seed_probe" in
-  *"--mode must be"*)
-    if (( seed_status != 0 )); then
-      pass "the seed artifact loads and validates its arguments"
-    else
-      fail "the seed artifact printed the usage text but exited 0 on a missing --mode"
-    fi ;;
-  *"Cannot find"*|*"ERR_MODULE_NOT_FOUND"*)
-    fail "the seed artifact cannot resolve its dependencies in the runner image: ${seed_probe}" ;;
-  *)
-    fail "unexpected seed artifact output: ${seed_probe}" ;;
-esac
-
-# ── The one-shot version-backfill artifact ────────────────────────────────
-# The canonical version backfill is a MIGRATION step that must be runnable on
-# the VPS against the scratch database, so it ships on exactly the same terms as
-# the Seed: one compiled bundle, no source tree, no TypeScript loader.
-if docker run --rm --entrypoint sh "$IMAGE" -c 'test -f /app/version-backfill-runner.mjs'; then
-  pass "the one-shot version-backfill artifact is present"
-else
-  fail "the runner image does not contain /app/version-backfill-runner.mjs"
-fi
-
-if docker run --rm --entrypoint sh "$IMAGE" -c \
-    'grep -qE "from .[^\"'"'"']*\.ts.|require\(.[^\"'"'"']*\.ts.\)" /app/version-backfill-runner.mjs'; then
-  fail "the version-backfill artifact still imports TypeScript sources"
-else
-  pass "the version-backfill artifact imports no TypeScript source"
-fi
-
-# Running it with no --mode must fail at argument parsing. That proves the whole
-# module graph loads inside the image without touching a database, and that the
-# entry-point guard still fires after esbuild bundling — a bundle whose guard
-# was optimised away would exit 0 having silently backfilled nothing.
-backfill_status=0
-backfill_probe="$(docker run --rm --entrypoint node "$IMAGE" /app/version-backfill-runner.mjs 2>&1)" || backfill_status=$?
-case "$backfill_probe" in
-  *"--mode must be"*)
-    if (( backfill_status != 0 )); then
-      pass "the version-backfill artifact loads and validates its arguments"
-    else
-      fail "the version-backfill artifact printed the usage text but exited 0 on a missing --mode"
-    fi ;;
-  *"Cannot find"*|*"ERR_MODULE_NOT_FOUND"*)
-    fail "the version-backfill artifact cannot resolve its dependencies in the runner image: ${backfill_probe}" ;;
-  *)
-    fail "unexpected version-backfill artifact output: ${backfill_probe}" ;;
-esac
+# ── Retired one-shot runners ──────────────────────────────────────────────
+# The canonical Seed and the Neon-import version backfill were removed from this
+# repository: Staging and Production keep their data on the server and are
+# recovered from verified backups, never re-seeded or re-imported. Neither
+# runner may reappear in a release image.
+for retired in /app/seed-runner.mjs /app/version-backfill-runner.mjs; do
+  if grep -qx "$retired" "$listing"; then
+    fail "retired one-shot runner present in image: ${retired}"
+  else
+    pass "absent: ${retired}"
+  fi
+done
 
 # Real environment files must never be baked in.
 if grep -Eq '^/app/\.env(\..*)?$' "$listing"; then

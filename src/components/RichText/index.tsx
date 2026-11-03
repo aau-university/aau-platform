@@ -1,4 +1,4 @@
-import type { SerializedEditorState } from 'lexical'
+import type { SerializedEditorState } from '@payloadcms/richtext-lexical/lexical'
 import {
   RichText as PayloadRichText,
   type JSXConverters,

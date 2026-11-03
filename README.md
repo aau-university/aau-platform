@@ -175,18 +175,11 @@ pnpm verify:generated    # regenerate and fail if tracked artifacts were stale
 
 Schema push exists only for the guarded local Docker development workflow. `pnpm schema:push` requires `APP_ENV=local-docker`, `NODE_ENV=development`, and `PAYLOAD_DB_PUSH=true`.
 
-## Canonical seed
+## Identity bootstrap (no content Seed)
 
-`pnpm seed` runs the single canonical seed entry point. It requires `INITIAL_ADMIN_EMAIL` and `INITIAL_ADMIN_PASSWORD`, validates a strong bootstrap password, and creates the first super-admin only through a one-shot bootstrap capability.
+The broad content Seed and the one-time Neon import tooling were removed from this repository. Staging and Production keep their data on the server and are recovered only from verified backups (`deploy/scripts/restore.sh`, `deploy/scripts/initialize-from-backup.sh`); nothing re-seeds or re-imports an environment.
 
-The normal seed is idempotent:
-
-- a second run creates and updates no records;
-- existing editor content and drafts are preserved;
-- relationships, localized state, timestamps, and version counts remain stable;
-- destructive content reset behavior is available only through explicit, allow-listed reset targets and is rejected in production.
-
-The HTTP seed adapter is disabled unless explicitly enabled. When enabled, `POST /next/seed` requires an exact trusted origin, an active authenticated super-admin session, an empty body, and a separate 64-character hexadecimal secret in the `x-payload-seed-secret` header. Do not put this secret in a URL.
+The only automatic data step is the minimal identity bootstrap (`PAYLOAD_RUNTIME_BOOTSTRAP=true`): at start it creates missing canonical Roles and the Super Admin named by `INITIAL_ADMIN_EMAIL` (with `INITIAL_ADMIN_PASSWORD` on first install), and never rewrites content.
 
 ## Local development
 
@@ -203,7 +196,6 @@ Install and run against an already prepared database:
 pnpm install --frozen-lockfile
 cp .env.example .env
 pnpm migrate
-pnpm seed
 pnpm dev
 ```
 
@@ -218,9 +210,9 @@ At minimum, configure:
   The VPS deployment uses the discrete form: a password containing `/`, `#`,
   `?` or `%` cannot survive being interpolated into a `redis://` URI.
 - `NEXT_PUBLIC_SERVER_URL` and `PAYLOAD_SERVER_ORIGIN`
-- `INITIAL_ADMIN_EMAIL` and a strong `INITIAL_ADMIN_PASSWORD` for the first seed
+- `INITIAL_ADMIN_EMAIL` and a strong `INITIAL_ADMIN_PASSWORD` for the first Super Admin (identity bootstrap)
 
-See `.env.example` for optional seed-endpoint, S3/R2, form-rate-limit, and plugin variables. Never commit real secrets.
+See `.env.example` for optional S3/R2, form-rate-limit, and plugin variables. Never commit real secrets.
 
 ## Docker development
 
@@ -237,11 +229,9 @@ The development graph waits for PostgreSQL and Redis, runs the guarded local sch
 docker compose up --watch
 ```
 
-Seed and reset operations are explicit profiles:
+The local reset operation is an explicit profile:
 
 ```bash
-docker compose --profile manual run --rm --build seed
-
 docker compose stop app-dev
 docker compose --profile manual run --rm --build db-reset
 docker compose up --wait

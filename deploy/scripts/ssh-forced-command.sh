@@ -66,7 +66,6 @@ case "$self" in
     ;;
 esac
 readonly ENTRYPOINT="${DEPLOY_ROOT}/scripts/deploy-entrypoint.sh"
-readonly SEED_ENTRYPOINT="${DEPLOY_ROOT}/scripts/seed-entrypoint.sh"
 
 # An interactive login attempt (no requested command) has an empty
 # SSH_ORIGINAL_COMMAND. Refuse it: this key is for deployments only.
@@ -88,28 +87,15 @@ set -- $request
 set +f
 
 # ── The whole vocabulary ──────────────────────────────────────────────────
-# Exactly two shapes are accepted:
+# Exactly one shape is accepted:
 #
 #   <image@sha256:...>     deploy that release
-#   seed <full|reset-and-full>   run the explicit one-shot canonical Seed
 #
-# Each dispatches to its OWN root-owned entrypoint with its own wildcard-free
-# sudoers rule, so the two capabilities can be granted independently — a
-# production deploy account need not be able to seed at all. Neither is a
-# shell, and neither takes a path.
-case "${1:-}" in
-  seed)
-    [[ $# -eq 2 ]] || fail "seed takes exactly one mode argument, got $(($# - 1))"
-    case "$2" in
-      full|reset-and-full) ;;
-      *) fail "unknown seed mode '$2' (expected full or reset-and-full)" ;;
-    esac
-    exec sudo -n "$SEED_ENTRYPOINT" "$2"
-    ;;
-  *)
-    [[ $# -eq 1 ]] || fail "expected exactly one image reference, got $# tokens"
-    # Hand the single validated token to the root-owned entrypoint. `sudo -n`
-    # fails closed if the wildcard-free NOPASSWD rule is absent.
-    exec sudo -n "$ENTRYPOINT" "$1"
-    ;;
-esac
+# It dispatches to the root-owned entrypoint through its wildcard-free sudoers
+# rule. It is not a shell and takes no path. (The former `seed <mode>` verb was
+# removed with the canonical Seed: environments keep their data on the server
+# and are recovered from verified backups, never re-seeded.)
+[[ $# -eq 1 ]] || fail "expected exactly one image reference, got $# tokens"
+# Hand the single validated token to the root-owned entrypoint. `sudo -n`
+# fails closed if the wildcard-free NOPASSWD rule is absent.
+exec sudo -n "$ENTRYPOINT" "$1"

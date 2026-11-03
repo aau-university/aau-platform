@@ -76,12 +76,10 @@ back to the running legacy build.
 
 ## 3. Intentionally unchanged
 
-- `migration/scripts/neon-import.sh` keeps `EXPECTED_IMPORT_REPO` on the legacy
-  staging package. It is the historical one-time Neon importer and must not be
-  run again (on either environment); pinned to the old channel it fails closed
-  against any new-channel release.
-- Historical acceptance records (`deploy/ACCEPTANCE.md`,
-  `migration/STAGING_ACCEPTANCE_*.md`) describe what was proven at the time.
+- The Neon importer and the content Seed were deleted (not frozen): no repository
+  tool can re-seed or re-import an environment.
+- Historical acceptance records (`deploy/ACCEPTANCE.md`) describe what was
+  proven at the time.
 - Image title label / `package.json` name `aau-payload-platform` are cosmetic,
   not a trust boundary.
 - GitHub settings, `STAGING_VPS_READY`, `PRODUCTION_VPS_READY` and the

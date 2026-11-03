@@ -13,21 +13,16 @@
  *      the Admin list view for a draft-enabled collection from the version
  *      table.
  *
- * (1) is a database-provisioning property and is proved by
- * tests/migration/neon-object-ownership-drill.sh against a real server, where
- * two roles actually exist. (2) is reproduced HERE, faithfully: each fixture
- * document is created normally, its version rows are then deleted — which is
- * exactly the state the migrated Neon content is in — and the canonical
- * backfill is run over it. The Admin assertions then prove the user-visible
- * outcome rather than the mechanism.
+ * Both were properties of the one-time Neon import, which has been retired
+ * together with its backfill. What remains asserted here is the user-visible
+ * outcome: every fixture document is created normally, with its versions, and
+ * the Admin views must show it.
  *
  * Pages and News are created the same way but keep their versions. They are the
  * controls: they were the two collections that kept working on staging, and a
  * change that breaks everything equally would otherwise look like a pass.
  */
 import type { Payload } from 'payload'
-
-import { runVersionBackfill } from '../../src/migration/version-backfill/backfill'
 
 const FIXTURE_CONTEXT = { disableRevalidate: true } as const
 
@@ -73,16 +68,9 @@ const SLUGS = {
   news: 'pr27-admin-news',
 } as const
 
-export interface AdminContentFixtureState {
-  /** Versions created by the first backfill run. Non-zero, or the fixtures proved nothing. */
-  created: number
-  /** Versions created by an immediate second run. Must be zero. */
-  createdOnRerun: number
-}
-
 export async function createAdminContentFixtures(
   payload: Payload,
-): Promise<AdminContentFixtureState> {
+): Promise<void> {
   await deleteAdminContentFixtures(payload)
 
   /** Create in the default locale, then write the English value as a second
@@ -200,38 +188,6 @@ export async function createAdminContentFixtures(
       slug: 'about-page',
     })
   }
-
-  // Reproduce the migrated condition: main rows present, version tables empty.
-  //
-  // Scoped by `parent` to THESE documents, not `where: {}`. The browser suite
-  // shares one local database across every spec and does not require it to be
-  // empty, so an unscoped delete would strip version history from any other
-  // document in these five collections — and `runVersionBackfill` would then
-  // backfill those too, making the `created > 0` assertion measure something
-  // other than these fixtures.
-  const backfilled = [
-    { collection: 'colleges', id: college.id },
-    { collection: 'academic-departments', id: department.id },
-    { collection: 'academic-programs', id: program.id },
-    { collection: 'faculty-members', id: facultyMember.id },
-    { collection: 'study-plans', id: studyPlan.id },
-  ] as const
-
-  for (const target of backfilled) {
-    await payload.db.deleteVersions({
-      collection: target.collection,
-      where: { parent: { equals: target.id } },
-    })
-  }
-  // Globals are singletons whose content this fixture has just overwritten, so
-  // there is no other document's history to scope away from here.
-  await payload.db.deleteVersions({ globalSlug: 'site-settings', where: {} })
-  await payload.db.deleteVersions({ globalSlug: 'about-page', where: {} })
-
-  const first = await runVersionBackfill(payload)
-  const second = await runVersionBackfill(payload)
-
-  return { created: first.created, createdOnRerun: second.created }
 }
 
 export async function deleteAdminContentFixtures(payload: Payload): Promise<void> {

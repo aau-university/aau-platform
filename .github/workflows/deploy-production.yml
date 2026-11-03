@@ -93,7 +93,7 @@ jobs:
   # The host re-validates all three independently; this is the half that can
   # give the operator a useful error before a maintenance window opens.
   verify:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: read
@@ -216,7 +216,7 @@ jobs:
   # ── 1. AUTHORIZE — the human gate, before anything on the host moves ────
   authorize:
     needs: verify
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment:
       name: production
     steps:
@@ -247,7 +247,7 @@ jobs:
   # ── 2. Cutover (gated) ──────────────────────────────────────────────────
   deploy:
     needs: [verify, authorize]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       cutover: ${{ steps.cutover.outcome }}
       smoke: ${{ steps.smoke.outcome }}

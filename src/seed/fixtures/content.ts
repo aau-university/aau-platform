@@ -1,8 +1,0 @@
-export { teamMemberFixtures } from './content/team-members'
-export { newsFixtures, eventFixtures } from './content/news-events'
-export { blogPostFixtures, faqFixtures, announcementFixtures } from './content/community'
-export { centerFixtures, projectFixtures } from './content/services'
-export { researchPublicationFixtures, campusLifeFixtures } from './content/research-campus'
-export { sliderFixtures, studentAffairsDocumentFixtures, admissionRequirementFixtures } from './content/keyless'
-export { offerFixtures, partnerFixtures } from './content/marketing'
-export { contentFixtureCounts } from './content/counts'

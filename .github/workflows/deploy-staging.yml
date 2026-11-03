@@ -48,14 +48,15 @@ on:
           Ref or SHA to deploy. Defaults to the configured STAGING_RELEASE_REF.
         type: string
         required: false
-      seed_mode:
+      artifact_only:
         description: >-
-          preserve = keep staging content (default) | full = run the canonical
-          Seed once after deploying | reset-and-full = DESTRUCTIVE, reset the
-          disposable staging content first
-        type: choice
-        options: [preserve, full, reset-and-full]
-        default: preserve
+          Build, gate and publish the staging image ONLY. No SSH, no host
+          cutover. The run summary states that the image was published and that
+          VPS deployment was not requested. Every gate before publication is
+          unchanged.
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -87,7 +88,7 @@ jobs:
   # `github.sha` is the commit that triggered the run, so the artifact, the
   # release gate and the deployment all refer to the same thing.
   gate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       deploy: ${{ steps.decide.outputs.deploy }}
       sha: ${{ steps.decide.outputs.sha }}
@@ -124,7 +125,7 @@ jobs:
   resolve:
     needs: gate
     if: needs.gate.outputs.deploy == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       sha: ${{ steps.pin.outputs.sha }}
       authorized: ${{ steps.authorize.outputs.authorized }}
@@ -204,7 +205,7 @@ jobs:
 
   authorize:
     needs: [resolve, release-gate]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment:
       name: staging
     steps:
@@ -251,17 +252,36 @@ jobs:
 
   deploy:
     needs: [resolve, authorize, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       cutover: ${{ steps.cutover.outcome }}
       smoke: ${{ steps.smoke.outcome }}
-      seed: ${{ steps.seed.outcome }}
     environment:
       name: staging
       url: ${{ vars.STAGING_SERVER_URL }}
     steps:
+      - name: Artifact-only run — VPS deployment not requested
+        if: inputs.artifact_only == true
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}@${{ needs.build.outputs.digest }}
+          READY: ${{ vars.STAGING_VPS_READY }}
+        run: |
+          {
+            echo "### Staging image published — NOT deployed to the VPS"
+            echo ""
+            echo "- pinned SHA: \`${{ needs.resolve.outputs.sha }}\`"
+            echo "- published artifact: \`${IMAGE}\` (staging channel)"
+            echo "- release gate, lineage authorization and staging approval: passed"
+            echo "- VPS deployment: **not requested** (\`artifact_only=true\`); no SSH"
+            echo "  connection was opened and no host step ran."
+            echo "- STAGING_VPS_READY: \`${READY:-unset}\` (unchanged by this run)"
+            echo ""
+            echo "This run proves a gated, published image. It is not a staging deployment."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::published ${IMAGE}; VPS deployment not requested (artifact_only)"
+
       - name: Guard — refuse to deploy before the staging host exists
-        if: vars.STAGING_VPS_READY != 'true'
+        if: vars.STAGING_VPS_READY != 'true' && inputs.artifact_only != true
         run: |
           {
             echo "### Staging cutover skipped"
@@ -276,7 +296,7 @@ jobs:
           exit 1
 
       - name: Configure SSH to the restricted staging deploy account
-        if: vars.STAGING_VPS_READY == 'true'
+        if: vars.STAGING_VPS_READY == 'true' && inputs.artifact_only != true
         env:
           SSH_KEY: ${{ secrets.STAGING_SSH_KEY }}
           SSH_KNOWN_HOSTS: ${{ secrets.STAGING_SSH_KNOWN_HOSTS }}
@@ -294,7 +314,7 @@ jobs:
 
       - name: Deploy the immutable digest to staging
         id: cutover
-        if: vars.STAGING_VPS_READY == 'true'
+        if: vars.STAGING_VPS_READY == 'true' && inputs.artifact_only != true
         env:
           IMAGE: ${{ needs.build.outputs.image }}@${{ needs.build.outputs.digest }}
         run: |
@@ -319,55 +339,6 @@ jobs:
             "${{ secrets.STAGING_SSH_USER }}@${{ secrets.STAGING_SSH_HOST }}" \
             -- "${IMAGE}"
 
-      # ── Optional explicit Seed ───────────────────────────────────────────
-      # Never automatic, never a restart-triggered side effect: a chosen input
-      # on a chosen run. `preserve` (the default) skips this entirely, which is
-      # what a normal staging deployment does.
-      - name: Run the explicit one-shot Seed
-        id: seed
-        env:
-          # Through `env:`, never interpolated into the `run` script. The
-          # `choice` type constrains the GitHub UI only — an API or CLI
-          # dispatch can submit any string, and GitHub substitutes it into the
-          # script TEXT before the shell parses it, so a value such as
-          # `full"; echo pwned; #` would close the ssh argument and run a
-          # command on the runner. The allow-list below is the first authority
-          # and the host's forced command is the second.
-          SEED_MODE: ${{ inputs.seed_mode || 'preserve' }}
-        # `inputs.seed_mode || 'preserve'`, not `inputs.seed_mode`: on a push
-        # event there are no inputs at all, so the bare comparison
-        # `inputs.seed_mode != 'preserve'` is true for an EMPTY value — an
-        # automatic deployment would have run `seed ` with no mode. An
-        # automatic deployment must never seed.
-        if: >-
-          vars.STAGING_VPS_READY == 'true' && steps.cutover.outcome == 'success'
-          && (inputs.seed_mode || 'preserve') != 'preserve'
-        run: |
-          # The seed operation is a separate forced command on the staging
-          # account, so this key can trigger exactly two things: a deployment
-          # and a seed — neither of which is a shell.
-          case "$SEED_MODE" in
-            preserve|full|reset-and-full) ;;
-            *) echo "::error::invalid seed_mode '${SEED_MODE}'" >&2; exit 1 ;;
-          esac
-
-          # BatchMode/ConnectTimeout/ServerAlive*: the forced command restricts what
-          # SSH_ORIGINAL_COMMAND may be, but it does not bound how long SSH waits
-          # to connect, authenticate, or notice a dead transport. Without these an
-          # unresponsive host holds the job to the Actions limit — and because the
-          # deployment concurrency group uses cancel-in-progress: false, it holds
-          # the next deployment behind it too.
-          ssh -i ~/.ssh/id_staging \
-            -o BatchMode=yes \
-            -o ConnectTimeout=15 \
-            -o ServerAliveInterval=30 \
-            -o ServerAliveCountMax=20 \
-            -o StrictHostKeyChecking=yes \
-            -o UserKnownHostsFile=~/.ssh/known_hosts \
-            -p "${{ secrets.STAGING_SSH_PORT || 22 }}" \
-            "${{ secrets.STAGING_SEED_SSH_USER || secrets.STAGING_SSH_USER }}@${{ secrets.STAGING_SSH_HOST }}" \
-            -- "seed ${SEED_MODE}"
-
       - name: Staging HTTPS smoke test
         id: smoke
         if: vars.STAGING_VPS_READY == 'true' && steps.cutover.outcome == 'success'
@@ -383,13 +354,11 @@ jobs:
           curl --fail --show-error --silent --output /dev/null "${ORIGIN}/"
 
       - name: Report the real outcome
-        if: always() && vars.STAGING_VPS_READY == 'true'
+        if: always() && vars.STAGING_VPS_READY == 'true' && inputs.artifact_only != true
         env:
           IMAGE: ${{ needs.build.outputs.image }}@${{ needs.build.outputs.digest }}
           CUTOVER: ${{ steps.cutover.outcome }}
           SMOKE: ${{ steps.smoke.outcome }}
-          SEED: ${{ steps.seed.outcome }}
-          SEED_MODE: ${{ inputs.seed_mode || 'preserve' }}
         run: |
           {
             echo "### Staging release report"
@@ -397,7 +366,6 @@ jobs:
             echo "- pinned SHA: \`${{ needs.resolve.outputs.sha }}\`"
             echo "- published artifact: \`${IMAGE}\` (staging channel)"
             echo "- host cutover: \`${CUTOVER}\`"
-            echo "- seed mode: \`${SEED_MODE}\` (\`${SEED}\`)"
             echo "- staging HTTPS smoke: \`${SMOKE}\`"
             echo ""
             if [ "$CUTOVER" = "success" ] && [ "$SMOKE" = "success" ]; then

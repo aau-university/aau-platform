@@ -3,7 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 import config from '@payload-config'
 import { ensureSystemRolesAndSuperAdmin } from '@/bootstrap/ensure-system-roles-and-super-admin'
-import { roleFixtures } from '@/seed/fixtures/roles'
+import { roleFixtures } from '@/bootstrap/role-fixtures'
 
 // Must match BOOTSTRAP_LOCK_ID in ensure-system-roles-and-super-admin.ts.
 const BOOTSTRAP_LOCK_ID = 1_095_783_765

@@ -102,37 +102,6 @@ services:
       redis:
         condition: service_healthy
 
-  seed:
-    profiles: [manual]
-    build:
-      context: .
-      target: dev
-    image: aau-payload-platform:dev
-    env_file:
-      - path: .env.docker
-        required: false
-    environment:
-      APP_ENV: local-docker
-      NODE_ENV: development
-      DATABASE_URI: postgresql://payload:payload@postgres:5432/aau_platform
-      DATABASE_DIRECT_URI: postgresql://payload:payload@postgres:5432/aau_platform
-      REDIS_URL: redis://redis:6379
-      PAYLOAD_DB_PUSH: 'false'
-      PAYLOAD_SERVER_ORIGIN: http://localhost:3000
-      NEXT_PUBLIC_SERVER_URL: http://localhost:3000
-    volumes:
-      - node-modules:/app/node_modules
-      - pnpm-store:/pnpm/store
-      - uploads:/app/uploads
-    command: ["pnpm", "seed"]
-    depends_on:
-      schema-init:
-        condition: service_completed_successfully
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-
   db-reset:
     profiles: [manual]
     build:

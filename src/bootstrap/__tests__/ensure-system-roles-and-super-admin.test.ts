@@ -1,5 +1,3 @@
-import { readFileSync } from 'node:fs'
-import path from 'node:path'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
@@ -22,7 +20,7 @@ import {
   assertBootstrapPasswordStrength,
   ensureSystemRolesAndSuperAdmin,
 } from '../ensure-system-roles-and-super-admin'
-import { roleFixtures } from '@/seed/fixtures/roles'
+import { roleFixtures } from '@/bootstrap/role-fixtures'
 
 const CANONICAL_SLUGS = ['super_admin', 'admin', 'content_manager', 'coordinator', 'student', 'doctor']
 
@@ -427,21 +425,6 @@ describe('concurrency safety', () => {
     expect(users).toHaveLength(1)
   })
 
-  it('uses a lock ID distinct from the broad seed lock', () => {
-    const bootstrapSource = readFileSync(
-      path.resolve(__dirname, '../ensure-system-roles-and-super-admin.ts'),
-      'utf8',
-    )
-    const seedSource = readFileSync(
-      path.resolve(__dirname, '../../seed/lib/advisory-lock.ts'),
-      'utf8',
-    )
-
-    const bootstrapId = /BOOTSTRAP_LOCK_ID = ([0-9_]+)/.exec(bootstrapSource)![1]
-    const seedId = /SEED_LOCK_ID = ([0-9_]+)/.exec(seedSource)![1]
-
-    expect(bootstrapId).not.toBe(seedId)
-  })
 })
 
 describe('password policy', () => {

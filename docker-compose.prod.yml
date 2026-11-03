@@ -1,24 +1,15 @@
 # CI SOURCE-BUILD REGRESSION CONTRACT — NOT the VPS runtime.
 #
 # This file exists to keep the source-built path working: build from source,
-# run the Payload CLI migration, run the broad canonical Seed, serve. The VPS
-# runs `deploy/docker-compose.vps.yml` with a prebuilt, source-free image and
-# shares none of this.
+# run the Payload CLI migration, serve. The VPS runs
+# `deploy/docker-compose.vps.yml` with a prebuilt, source-free image and shares
+# none of this.
 #
-# Two names to keep straight, because they are different operations:
-#
-#   minimal identity bootstrap  create missing canonical Roles and the
-#                               configured Super Admin, nothing else. Runs
-#                               automatically at application start, in both
-#                               environments. Never rewrites content.
-#
-#   canonical Seed              broad content: taxonomy, departments, programs,
-#                               academic and editorial content, navigation,
-#                               globals. NEVER runs at startup anywhere. On the
-#                               VPS it is an explicit one-shot operation from a
-#                               source-free bundled artifact.
-#
-# The service below runs the SECOND one, and is named accordingly.
+# app-prod performs the same minimal identity bootstrap the VPS runtime does:
+# create missing canonical Roles and the configured Super Admin, nothing else,
+# on every start, never rewriting content. There is no broad content Seed: it
+# was removed, because every environment keeps its data on the server and is
+# recovered from verified backups.
 x-runtime-environment: &runtime-environment
   NODE_ENV: production
   # This stack is exercised over loopback HTTP in CI, while the production
@@ -84,47 +75,6 @@ services:
       postgres-prod:
         condition: service_healthy
 
-  # ── Named for what it actually does ──────────────────────────────────────
-  # This service runs `pnpm seed` — the BROAD canonical Seed: taxonomy,
-  # departments, programs, academic and editorial content, navigation and
-  # globals. It was previously called `seed-bootstrap-prod`, which read as the
-  # minimal identity bootstrap the VPS runtime performs. Those are different
-  # operations with different blast radii, and blurring them in the name of a
-  # service is how someone eventually runs the wrong one against production.
-  #
-  # The VPS runtime never uses this service, this image, or this file. Its
-  # canonical Seed is an explicit one-shot operation run from a source-free
-  # bundled artifact (deploy/scripts/seed.sh).
-  canonical-seed-source-build:
-    image: aau-payload-platform:operations
-    restart: 'no'
-    profiles: ['canonical-seed']
-    environment:
-      <<: *runtime-environment
-      # The canonical Seed is a STAGING-ONLY operation, and this service is the
-      # source-build analogue of `deploy/scripts/seed.sh`, whose entrypoint
-      # (`deploy/scripts/seed-entrypoint.sh`) hard-binds `AAU_ENV=staging`
-      # before it will invoke the Seed at all. Declare the same identity here.
-      #
-      # Nothing else in this file sets AAU_ENV, and that is deliberate: every
-      # other service stays production-assumed, so the drill that runs after
-      # this one still proves a PRODUCTION runtime never reseeds on redeploy.
-      # Hoisting this line into `*runtime-environment` would make that proof
-      # vacuous. `src/seed/run-seed.ts` refuses a broad Seed in production, so
-      # without this the Seed step fails closed — which is the guard working,
-      # not a defect to route around by relabelling the whole stack.
-      AAU_ENV: staging
-      INITIAL_ADMIN_EMAIL: ${INITIAL_ADMIN_EMAIL:-}
-      INITIAL_ADMIN_PASSWORD: ${INITIAL_ADMIN_PASSWORD:-}
-    command: ['pnpm', 'seed']
-    volumes:
-      - uploads-prod:/app/uploads
-    depends_on:
-      migrate-prod:
-        condition: service_completed_successfully
-      postgres-prod:
-        condition: service_healthy
-
   app-prod:
     build:
       context: .
@@ -136,7 +86,13 @@ services:
     restart: unless-stopped
     ports:
       - '127.0.0.1:3000:3000'
-    environment: *runtime-environment
+    environment:
+      <<: *runtime-environment
+      # The production identity bootstrap, as on the VPS (see
+      # deploy/docker-compose.vps.yml). Values come from the CI step env.
+      PAYLOAD_RUNTIME_BOOTSTRAP: 'true'
+      INITIAL_ADMIN_EMAIL: ${INITIAL_ADMIN_EMAIL:-}
+      INITIAL_ADMIN_PASSWORD: ${INITIAL_ADMIN_PASSWORD:-}
     volumes:
       - uploads-prod:/app/uploads
     depends_on:

@@ -10,7 +10,7 @@ import {
 import type { Role, User } from '@/payload-types'
 
 import { relationshipId } from '../access/relationship-id'
-import { roleFixtures } from '../seed/fixtures/roles'
+import { roleFixtures } from './role-fixtures'
 
 /**
  * Minimal production identity bootstrap.
@@ -47,9 +47,8 @@ import { roleFixtures } from '../seed/fixtures/roles'
 /**
  * Dedicated PostgreSQL advisory lock ID for the runtime identity bootstrap.
  *
- * Deliberately distinct from the seed lock in `src/seed/lib/advisory-lock.ts`
- * (1_095_783_764): a seed run and a container start must not silently block
- * one another under a shared key, and they guard different invariants.
+ * The value is unchanged from when a content Seed (lock 1_095_783_764) still
+ * existed, so a running bootstrap keeps the same key across this upgrade.
  */
 const BOOTSTRAP_LOCK_ID = 1_095_783_765
 

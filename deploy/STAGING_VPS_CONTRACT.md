@@ -278,8 +278,8 @@ ssh-ed25519 AAAA... aau-deploy@ci
 
 With a forced command, sshd ignores whatever the client asked for and always
 runs that wrapper; the client's request survives only in
-`$SSH_ORIGINAL_COMMAND`. The wrapper accepts exactly two shapes — an image
-digest, or `seed <full|reset-and-full>` — and nothing else.
+`$SSH_ORIGINAL_COMMAND`. The wrapper accepts exactly one shape — an image
+digest — and nothing else.
 
 The staging copy needs **no editing**. The wrapper derives its environment from
 its own installed path (`/srv/aau/{production,staging}/deploy/scripts/...`), so
@@ -311,22 +311,14 @@ the forced command by adding a second key.
 ```
 aau-deploy         ALL=(root) NOPASSWD: /srv/aau/production/deploy/scripts/deploy-entrypoint.sh
 aau-deploy-staging ALL=(root) NOPASSWD: /srv/aau/staging/deploy/scripts/deploy-entrypoint.sh
-aau-deploy-staging ALL=(root) NOPASSWD: /srv/aau/staging/deploy/scripts/seed-entrypoint.sh
 Defaults!/srv/aau/production/deploy/scripts/deploy-entrypoint.sh !requiretty
 Defaults!/srv/aau/staging/deploy/scripts/deploy-entrypoint.sh    !requiretty
-Defaults!/srv/aau/staging/deploy/scripts/seed-entrypoint.sh      !requiretty
 ```
 
 No wildcards, no shell, no `env_keep` additions. `env_reset` must stay on
 (the default).
 
-**Production has no seed rule, and must not be given one.** Deploying and
-writing canonical content are different capabilities, and production's content
-is the accepted migrated dataset rather than this repository's fixtures. Both
-Seed modes are refused against production in three independent places — the
-runner, `seed.sh`, and `seed-entrypoint.sh` itself, which checks the environment
-its own installed path selects. A production copy of the entrypoint is therefore
-inert, and installing one is a mistake rather than a capability.
+**There is no seed rule in either environment.** The Seed was removed; if a `seed-entrypoint.sh` sudoers line or file from an older handoff is still installed on a host, remove it.
 
 Production content is installed once, by an operator on the host, with
 `deploy/scripts/initialize-from-backup.sh` (see `deploy/README.md` §12b), and
@@ -564,9 +556,7 @@ None of these can be satisfied by CI. Each must be performed and recorded.
 | 3 | **Restore** | `restore.sh` returns the database *and* the paired image to a known state |
 | 4 | **Off-host restore** | A restore from the OFF-HOST copy (§12). The one that actually matters |
 | 5 | **Backup/image retention** | A retained backup's paired image is still pullable |
-| 6 | **Seed: preserve** | A normal staging deploy leaves content untouched |
-| 7 | **Seed: full** | The explicit one-shot Seed creates canonical content and verifies it |
-| 8 | **Seed: reset-and-full** | Works on staging; **refused** on production, as is `full` |
+| 6 | **Content preserved** | A normal staging deploy leaves content untouched (there is no Seed) |
 | 8a | **First-install initialization** | `initialize-from-backup.sh` founds a virgin production environment from the final verified staging platform backup, and refuses a second run |
 | 9 | **Minimal bootstrap** | A normal deploy creates missing Roles and the Super Admin and nothing else |
 | 10 | **Upload persistence** | Media survives a redeploy, a restart and a reboot |

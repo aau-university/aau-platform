@@ -32,9 +32,9 @@ EXPOSE 3000
 ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["pnpm", "dev"]
 
-# One-shot production operations image. Payload migrations and the canonical
-# seed run from the exact same source and dependency graph as the application,
-# while the runtime image remains a minimal Next.js standalone image.
+# One-shot production operations image. Payload migrations run from the exact
+# same source and dependency graph as the application, while the runtime image
+# remains a minimal Next.js standalone image.
 FROM deps AS operations
 COPY . .
 ENV NODE_ENV=production
@@ -94,29 +94,6 @@ RUN if [ "${NEXT_PUBLIC_SERVER_URL#https://}" != "${NEXT_PUBLIC_SERVER_URL}" ]; 
 # storage — they are readable in the image history.
 RUN PAYLOAD_SECRET=build-only-non-production-secret-not-used-at-runtime \
   pnpm run build
-
-# Bundle the canonical Seed into ONE compiled artifact.
-#
-# The Seed needs the Payload config, and the config imports every collection,
-# global, field, hook and plugin — effectively the whole `src/` tree. Shipping a
-# runtime TypeScript loader instead would mean shipping that source tree and the
-# Payload CLI to the VPS: the `operations` image this deployment deliberately
-# does not ship. Bundling collapses it into a single `.mjs` that the runner
-# image can execute and nobody can meaningfully edit in place.
-#
-# Only first-party code is inlined; dependencies resolve at runtime from the
-# standalone `node_modules` that already ships in the runner, so the Seed runs
-# against byte-identical Payload internals to the application itself. The output
-# is written into `.next/standalone`, so the existing COPY below carries it in
-# with no extra layer.
-RUN node scripts/build-seed-runner.mjs
-
-# The one-shot canonical version backfill ships the same way and for the same
-# reasons. Like the Seed it is an explicit operation, not a startup step: it is
-# run deliberately against a scratch database before that database is promoted,
-# and never by a normal deploy or from application startup. The image only
-# carries the artifact; nothing here knows or needs to know who invokes it.
-RUN node scripts/build-version-backfill-runner.mjs
 
 # Production image, copy all the files and run next
 FROM node:24.19.0-bookworm-slim@sha256:a9f5f7c91a432850b2a8a7797adf5eadb6c733ceed61167806cee7ea7fbc29df AS runner

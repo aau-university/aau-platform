@@ -324,76 +324,11 @@ lists what must be copied before the old credentials are revoked.
 
 ---
 
-## 6. The canonical Seed
+## 6. No content Seed
 
-Two operations that must not be confused:
+The broad content Seed and the one-time Neon import tooling were removed from this repository. Staging and Production keep their data on the server and are recovered only from verified backups (`deploy/scripts/restore.sh`, `deploy/scripts/initialize-from-backup.sh`); nothing re-seeds or re-imports an environment.
 
-| | minimal identity bootstrap | canonical Seed |
-|---|---|---|
-| What | missing canonical Roles + the configured Super Admin | taxonomy, departments, programs, academic and editorial content, navigation, globals |
-| When | automatically, every start | **only** when explicitly invoked |
-| Rewrites content | never | yes, by design |
-
-There is **no `FULL_SEED=true`**. Such a flag would re-run the broad Seed after
-every host reboot, OOM kill and routine redeploy, silently rewriting content.
-
-```
-# Staging: normal deploy, content preserved       -> just deploy, no seed step
-# Staging: seed canonical content once
-AAU_ENV=staging deploy/scripts/seed.sh full
-# Staging ONLY: destructive reset, then seed
-AAU_ENV=staging deploy/scripts/seed.sh reset-and-full
-```
-
-### The Seed is a STAGING capability
-
-Both modes are refused against production, in three independent places: the
-host script, the root-owned entrypoint, and the seed runner itself. There is no
-confirmation string, because there is nothing to confirm.
-
-Production content is the **accepted migrated dataset**. It arrives once, from a
-verified platform backup:
-
-```
-# first install, once, on a virgin production environment
-AAU_ENV=production \
-ALLOW_FIRST_INSTALL_FROM_BACKUP=I-UNDERSTAND-THIS-INITIALIZES-PRODUCTION \
-  deploy/scripts/initialize-from-backup.sh /path/to/<verified-backup>
-
-# afterwards, recovery is a restore, never a seed
-deploy/scripts/restore.sh /srv/aau/production/backups/<timestamp>
-```
-
-The canonical Seed writes a *different* dataset — this repository's fixtures —
-so running it against production would overlay repository content onto real
-content the university has been editing. `full` used to be reachable behind a
-typed `SEED_CONFIRM` for a "deliberate first-install content initialisation";
-that use case is now served by the platform backup, and the confirmation was
-removed rather than left in place, because a retired escape hatch still named in
-the code reads as a supported one.
-
-**A destructive reset fails closed — but only when it was actually
-destructive.** `reset-and-full` takes a pre-seed backup, stops the app for one
-maintenance window, and runs the reset. There are two failure classes, handled
-oppositely:
-
-- **The pre-seed backup fails, before any reset runs.** The database is
-  untouched, so leaving staging down would be an outage with no upside.
-  `seed.sh` restarts the prior app service, refuses the reset, and exits
-  non-zero. (Taking the backup requires stopping the app first, so this is a
-  deliberate restart, not a no-op.)
-- **The reset itself fails partway.** The seed is **not one transaction** —
-  each stage commits independently — so staging may be partially reset. Here
-  `seed.sh` does **not** restart the app: it keeps app-prod stopped (a
-  half-reset site must not be served as if healthy), prints the exact pre-seed
-  restore point and the `restore.sh` command to recover it, and exits non-zero.
-
-A clean reset closes the maintenance window and restarts the app normally.
-
-The Seed runs from `/app/seed-runner.mjs` — a single bundled artifact built
-from the exact release SHA, inside the release image that is already deployed.
-The VPS never receives the source tree, the Payload CLI, or an HTTP seed
-endpoint.
+The minimal identity bootstrap (missing canonical Roles + the configured Super Admin, automatically on every start, never rewriting content) is unchanged.
 
 ---
 
@@ -653,9 +588,8 @@ frozen Neon -> corrected migration on STAGING -> accepted staging
   -> final verified staging platform backup -> production
 ```
 
-`migration/scripts/neon-import.sh` is **staging-only and stays that way**: it
-converts a source schema, which is a rehearsal, and it refuses production with
-no override. Production restores an already-correct schema instead:
+The Neon import that produced the accepted Staging dataset is complete and its
+tooling has been removed. Production restores an already-correct schema instead:
 
 ```
 # on the production host, as root, against a VIRGIN environment

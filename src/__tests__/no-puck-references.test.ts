@@ -32,7 +32,6 @@ describe('removed page-builder guard', () => {
     const files = [
       'src/payload.config.ts',
       'src/app/(frontend)/page.tsx',
-      'src/seed/run-seed.ts',
       'tests/helpers/seedUser.ts',
     ]
 

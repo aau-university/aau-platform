@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 
@@ -141,7 +141,6 @@ const deployWorkflow = read('.github/workflows/deploy-production.yml')
 const releaseWorkflow = read('.github/workflows/release-production.yml')
 const publicVerifyWorkflow = read('.github/workflows/verify-production-public.yml')
 const initializeScript = read('deploy/scripts/initialize-from-backup.sh')
-const neonImportScript = read('migration/scripts/neon-import.sh')
 const releaseGateWorkflow = read('.github/workflows/release-gate.yml')
 const stagingWorkflow = read('.github/workflows/deploy-staging.yml')
 
@@ -689,10 +688,10 @@ describe('restricted SSH deploy account', () => {
     // No wildcard anywhere in a sudo rule, and never the docker group.
     expect(hostContract).not.toMatch(/NOPASSWD:[^\n]*\*/)
     expect(hostContract).toContain('`docker` group')
-    // Production deliberately gets no seed rule: deploying and writing
-    // canonical content are different capabilities, and production content is
-    // the accepted migrated dataset rather than this repository's fixtures.
-    expect(hostContract).toContain('Production has no seed rule, and must not be given one')
+    // The content Seed was removed: no seed sudo rule exists in either
+    // environment, and an older host copy must be removed rather than kept.
+    expect(hostContract).toContain('There is no seed rule in either environment')
+    expect(hostContract).not.toMatch(/NOPASSWD:[^\n]*seed-entrypoint/)
     expect(hostContract).toContain('initialize-from-backup.sh')
   })
 
@@ -1083,11 +1082,7 @@ describe('Dockerfile', () => {
 // claim into something untrue.
 // ═══════════════════════════════════════════════════════════════════════════
 
-const seedScript = read('deploy/scripts/seed.sh')
-const seedEntrypoint = read('deploy/scripts/seed-entrypoint.sh')
 const composeWrapper = read('deploy/scripts/compose.sh')
-const seedRunner = read('src/seed/one-shot.ts')
-const seedBundler = read('scripts/build-seed-runner.mjs')
 const sourceBuildCompose = read('docker-compose.prod.yml')
 const apacheReference = read('deploy/reverse-proxy/apache-cpanel.conf.example')
 const hostContract = read('deploy/STAGING_VPS_CONTRACT.md')
@@ -1303,7 +1298,11 @@ describe('publication trust boundary', () => {
     expect(gate).toMatch(/Adding it to the baseline is not the fix/)
 
     const baseline = JSON.parse(read('.github/security/audit-baseline.json'))
-    expect(Object.keys(baseline.advisories).length).toBeGreaterThan(0)
+    // An EMPTY baseline is the strictest state: every high/critical production
+    // advisory fails the gate. Any entry that is present must carry its record.
+    for (const entry of Object.values(baseline.advisories) as Record<string, unknown>[]) {
+      expect(entry).toMatchObject({ module: expect.any(String), severity: expect.any(String) })
+    }
     // A baseline with no review date is an exemption list.
     expect(baseline.review_by).toMatch(/^\d{4}-\d{2}-\d{2}$/)
     expect(new Date(baseline.review_by).getTime()).toBeGreaterThan(
@@ -1362,22 +1361,23 @@ describe('staging environment', () => {
     expect(stagingWorkflow).not.toMatch(/name: production/)
   })
 
-  it('keeps the Seed explicit, opt-in and bounded to the three staging modes', () => {
-    // preserve is the default on every path, including a `push` event where
-    // there are no inputs at all, so a normal staging deployment never seeds.
-    expect(stagingWorkflow).toMatch(/inputs\.seed_mode \|\| 'preserve'/)
-
-    // The allow-list is the authority, not the `choice` type: an API dispatch
-    // can submit any string. All three staging modes must survive it --
-    // reset-and-full is a real staging operation and this gate must not be the
-    // thing that quietly removes it.
-    expect(stagingWorkflow).toMatch(/preserve\|full\|reset-and-full\) ;;/)
-    expect(stagingWorkflow).toMatch(/invalid seed_mode/)
-
-    // And the mode reaches the shell through the environment, never through
-    // `${{ }}` interpolated into the script text.
-    expect(stagingWorkflow).toMatch(/-- "seed \$\{SEED_MODE\}"/)
-    expect(stagingWorkflow).not.toMatch(/-- "seed \$\{\{/)
+  it('publishes without touching the host only on an explicit artifact_only dispatch', () => {
+    // Opt-in boolean, default false: a push or a normal dispatch still goes to
+    // the host (or is refused by the readiness guard).
+    expect(stagingWorkflow).toMatch(/artifact_only:\n[\s\S]*?type: boolean\n[\s\S]*?default: false/)
+    // Publication is unchanged: build still needs the release gate and approval.
+    expect(stagingWorkflow).toMatch(/build:\n    needs: \[resolve, release-gate, authorize\]/)
+    // The readiness guard still refuses a normal run when the host is not ready.
+    expect(stagingWorkflow).toMatch(
+      /Guard — refuse to deploy before the staging host exists\n        if: vars\.STAGING_VPS_READY != 'true' && inputs\.artifact_only != true/,
+    )
+    // Every host-touching step is off in artifact-only mode.
+    for (const step of ['Configure SSH to the restricted staging deploy account', 'Deploy the immutable digest to staging']) {
+      const block = stagingWorkflow.split(`- name: ${step}`)[1]!.split('- name:')[0]!
+      expect(block).toMatch(/inputs\.artifact_only != true/)
+    }
+    // And the summary says what happened: published, NOT deployed.
+    expect(stagingWorkflow).toMatch(/Staging image published — NOT deployed to the VPS/)
   })
 
   it('authorizes the pinned SHA only against a lineage it successfully fetched', () => {
@@ -1420,101 +1420,38 @@ describe('staging environment', () => {
   })
 })
 
-describe('one-shot canonical Seed', () => {
-  it('is never a startup toggle', () => {
-    // A FULL_SEED-style flag would re-run the broad Seed after every reboot,
-    // OOM kill and routine redeploy.
-    // Executable content only: seed.sh's header explains WHY there is no such
-    // flag, and that explanation has to be allowed to name it.
-    for (const file of [vpsCompose, deployScript, seedScript, seedRunner]) {
-      expect(withoutComments(file)).not.toMatch(/FULL_SEED/)
+describe('the canonical Seed is removed', () => {
+  // Every environment keeps its data on the server and is recovered from
+  // verified backups; nothing re-seeds it. The Seed tooling was deleted, and
+  // these guard against it quietly coming back.
+  it.each([
+    'deploy/scripts/seed.sh',
+    'deploy/scripts/seed-entrypoint.sh',
+    'scripts/build-seed-runner.mjs',
+    'src/seed',
+    'tests/docker/seed-one-shot-drill.sh',
+    'src/app/(frontend)/next/seed',
+  ])('%s no longer exists', (relative) => {
+    expect(existsSync(path.resolve(REPO_ROOT, relative))).toBe(false)
+  })
+
+  it('is not built into the runner image', () => {
+    expect(dockerfile).not.toMatch(/build-seed-runner|seed-runner\.mjs/)
+    expect(read('scripts/assert-runner-image.sh')).toMatch(/for retired in \/app\/seed-runner\.mjs/)
+  })
+
+  it('cannot be requested by any workflow', () => {
+    for (const workflow of [stagingWorkflow, releaseGateWorkflow, deployWorkflow, releaseWorkflow]) {
+      expect(workflow).not.toMatch(/seed_mode|STAGING_SEED_SSH_USER|"seed /)
     }
-    expect(vpsCompose).toMatch(/PAYLOAD_SEED_ENABLED: 'false'/)
-    // deploy.sh must never INVOKE a seed. (It may name seed.sh in operator
-    // guidance, so this looks for an invocation rather than the word.)
-    expect(withoutComments(deployScript)).not.toMatch(/seed-runner|seed\.sh"/)
-  })
-
-  it('refuses a production Seed in three independent places', () => {
-    expect(seedScript).toMatch(/STAGING-ONLY/)
-    expect(seedEntrypoint).toMatch(/STAGING-ONLY/)
-    expect(seedRunner).toMatch(/STAGING-ONLY/)
-  })
-
-  it('leaves no typed confirmation that could re-open a production Seed', () => {
-    // `full` was once reachable in production behind
-    // SEED_CONFIRM=I-UNDERSTAND-THIS-WRITES-CANONICAL-CONTENT, for a "deliberate
-    // first-install content initialisation". That use case is now served by
-    // deploy/scripts/initialize-from-backup.sh, which installs the ACCEPTED
-    // migrated dataset rather than this repository's fixtures. A retired
-    // confirmation left in the code reads as a supported escape hatch, so none
-    // of the three layers may still mention one.
-    for (const layer of [seedScript, seedEntrypoint, seedRunner]) {
-      expect(layer).not.toMatch(/I-UNDERSTAND-THIS-WRITES-CANONICAL-CONTENT/)
-      expect(layer).not.toMatch(/SEED_CONFIRM/)
-    }
-    expect(seedRunner).toMatch(/initialize-from-backup\.sh/)
-    expect(seedScript).toMatch(/initialize-from-backup\.sh/)
-    expect(seedEntrypoint).toMatch(/initialize-from-backup\.sh/)
-  })
-
-  it('ships as a source-free bundle, not a source tree plus a loader', () => {
-    expect(dockerfile).toMatch(/node scripts\/build-seed-runner\.mjs/)
-    expect(seedScript).toMatch(/node \/app\/seed-runner\.mjs/)
-    // No Payload CLI and no TypeScript loader on the VPS.
-    expect(withoutComments(seedScript)).not.toMatch(/pnpm|tsx|payload run/)
-    // The image assertion must LOAD the artifact, not just look for the file:
-    // a bundle whose externals cannot resolve is present but useless.
-    expect(read('scripts/assert-runner-image.sh')).toMatch(/ERR_MODULE_NOT_FOUND/)
-  })
-
-  it('bundles the origin the image was built with', () => {
-    // `next build` replaces process.env.NEXT_PUBLIC_* with literals; esbuild
-    // does not. Without this the seed would read an undefined origin and throw
-    // while the application beside it, built from the same source, works.
-    expect(seedBundler).toMatch(/'process\.env\.NEXT_PUBLIC_SERVER_URL'/)
-  })
-
-  it('validates its arguments before loading the Payload config', () => {
-    // A production reset-and-full must be refused even where the config cannot
-    // be built, and a mistyped mode should not produce a stack trace from deep
-    // inside configuration loading.
-    expect(seedRunner).toMatch(/await import\('@payload-config'\)/)
-    expect(seedRunner).not.toMatch(/^import config from '@payload-config'/m)
-  })
-
-  it('serializes against deploy, restore and backup', () => {
-    expect(seedScript).toMatch(/oplock_acquire "\$AAU_LOCK_FILE"/)
-  })
-
-  it('takes a restore point before a destructive staging reset', () => {
-    expect(seedScript).toMatch(/pre-seed backup/)
-    expect(seedScript).toMatch(/refusing to run a destructive reset without a restore point/)
-  })
-
-  it('handles the two seed failure classes oppositely', () => {
-    // Class A — the pre-seed backup fails BEFORE any destructive work. The
-    // database is untouched, so the prior service must be RESTORED, not left
-    // down. backup.sh is told RESTART_AFTER_QUIESCE=false, so seed.sh owns this.
-    expect(seedScript).toMatch(/RESTART_AFTER_QUIESCE=false/)
-    expect(seedScript).toMatch(/restoring the prior app service/)
-    const classAIdx = seedScript.indexOf('restoring the prior app service')
-    const refuseIdx = seedScript.indexOf('refusing to run a destructive reset without a restore point')
-    expect(classAIdx).toBeGreaterThan(-1)
-    expect(refuseIdx).toBeGreaterThan(classAIdx)
-    // Class B — the destructive seed fails AFTER the reset began. The app must
-    // be LEFT STOPPED (staging may be half-reset), and the trap must not restart.
-    expect(seedScript).toMatch(/reset_seed_failed=true/)
-    expect(seedScript).toMatch(/LEFT STOPPED on purpose/)
-    expect(seedScript).toMatch(/may be PARTIALLY/)
   })
 })
 
 describe('privileged SSH vocabulary', () => {
-  it('accepts exactly two shapes and no path', () => {
-    expect(forcedCommandScript).toMatch(/case "\$\{1:-\}" in/)
-    expect(forcedCommandScript).toMatch(/full\|reset-and-full\) ;;/)
+  it('accepts exactly one shape and no path', () => {
     expect(forcedCommandScript).toMatch(/expected exactly one image reference/)
+    expect(forcedCommandScript).toMatch(/exec sudo -n "\$ENTRYPOINT" "\$1"/)
+    expect(withoutComments(forcedCommandScript)).not.toMatch(/seed|SEED_ENTRYPOINT/)
     // Never relocatable: an SSH client can request environment variables, so a
     // `${DEPLOY_ROOT:-...}` fallback would be caller-controlled here. And the
     // environment is derived from the file's own installed path rather than a
@@ -1532,39 +1469,9 @@ describe('privileged SSH vocabulary', () => {
     expect(forcedCommandScript).toMatch(/refusing a multi-line command/)
     expect(forcedCommandScript).toMatch(/set -f/)
   })
-
-  it('routes seeding through its own entrypoint and sudo rule', () => {
-    // Deploying and writing canonical content are different capabilities, so
-    // they must be grantable independently.
-    expect(forcedCommandScript).toMatch(/SEED_ENTRYPOINT/)
-    expect(seedEntrypoint).toMatch(/exec env -i/)
-  })
-
-  it('refuses to seed anything but staging, from its own installed path', () => {
-    // The Seed writes this repository's canonical content. Production content
-    // is the accepted migrated dataset, so there is no production Seed to
-    // authorize — and therefore no confirmation string anywhere in this path
-    // that a remote key could supply, or that a future edit could forward.
-    expect(seedEntrypoint).toMatch(/\[\[ "\$AAU_ENV" == "staging" \]\]/)
-    expect(seedEntrypoint).toMatch(/STAGING-ONLY/)
-    expect(seedEntrypoint).toMatch(/initialize-from-backup\.sh/)
-    expect(seedEntrypoint).not.toMatch(/SEED_CONFIRM/)
-    expect(seedScript).not.toMatch(/SEED_CONFIRM/)
-  })
 })
 
-describe('source-build regression contract is named truthfully', () => {
-  it('does not call the broad Seed a bootstrap', () => {
-    // `seed-bootstrap-prod` running `pnpm seed` read as the minimal identity
-    // bootstrap while actually running the broad canonical Seed. Those have
-    // very different blast radii.
-    // The old name survives only in the comment explaining the rename.
-    expect(withoutComments(sourceBuildCompose)).not.toMatch(/seed-bootstrap-prod/)
-    expect(sourceBuildCompose).toMatch(/canonical-seed-source-build:/)
-    expect(sourceBuildCompose).toMatch(/minimal identity bootstrap/)
-    expect(releaseGateWorkflow).not.toMatch(/seed-bootstrap-prod/)
-  })
-
+describe('compose wrapper', () => {
   it('locks mutating compose subcommands and leaves read-only ones alone', () => {
     // `composeWrapper` was read and never used, which ESLint reports and which
     // meant deploy/scripts/compose.sh had no static guard at all. It has one
@@ -1594,30 +1501,11 @@ describe('source-build regression contract is named truthfully', () => {
     expect(sourceBuildCompose).toMatch(/NOT the VPS runtime/)
   })
 
-  it('declares the staging identity on the Seed service and nowhere else', () => {
-    // `src/seed/run-seed.ts` refuses a broad Seed in production, and
-    // `isProductionDeployment()` treats an UNSET AAU_ENV as production. So the
-    // canonical-Seed service has to name itself staging — exactly as
-    // `deploy/scripts/seed-entrypoint.sh` hard-binds AAU_ENV=staging before
-    // invoking the Seed on the VPS.
-    //
-    // The narrowness is the point. If AAU_ENV=staging is hoisted into
-    // `*runtime-environment` to silence the same failure, app-prod stops being
-    // a production runtime and the redeploy drill below it — which proves a
-    // production deployment never reseeds — silently proves nothing.
-    const declarations = withoutComments(sourceBuildCompose).match(/^\s*AAU_ENV:.*$/gm) ?? []
-    expect(declarations).toHaveLength(1)
-    expect(declarations[0]?.trim()).toBe('AAU_ENV: staging')
-
-    const anchorBlock = sourceBuildCompose.slice(0, sourceBuildCompose.indexOf('\nservices:'))
-    expect(withoutComments(anchorBlock)).not.toMatch(/AAU_ENV/)
-
-    const seedServiceIdx = sourceBuildCompose.indexOf('  canonical-seed-source-build:')
-    const appServiceIdx = sourceBuildCompose.indexOf('  app-prod:')
-    expect(seedServiceIdx).toBeGreaterThan(-1)
-    expect(appServiceIdx).toBeGreaterThan(seedServiceIdx)
-    const seedService = sourceBuildCompose.slice(seedServiceIdx, appServiceIdx)
-    expect(withoutComments(seedService)).toMatch(/^\s*AAU_ENV: staging$/m)
+  it('declares no environment identity: every service is a production runtime', () => {
+    // With the canonical Seed gone there is no staging-only service left, so
+    // nothing in the source-build stack may name itself staging — app-prod and
+    // its redeploy drill must prove the production runtime.
+    expect(withoutComments(sourceBuildCompose)).not.toMatch(/^\s*AAU_ENV:/m)
   })
 })
 
@@ -1648,7 +1536,7 @@ describe('host contract and documentation truthfulness', () => {
       '127.0.0.1:3000', '127.0.0.1:13000',
       'aau-production', 'aau-staging',
       'docker` group', 'ssh-forced-command.sh', 'release-policy.conf',
-      'PENDING REAL VPS', 'off-host', 'Reboot', 'reset-and-full',
+      'PENDING REAL VPS', 'off-host', 'Reboot', 'Content preserved',
     ]) {
       expect(hostContract, `host contract must document ${needle}`).toContain(needle)
     }
@@ -1758,7 +1646,6 @@ describe('first-install data initialization', () => {
     expect(initializeScript).toMatch(/\[\[ "\$role_ready" == "true" \]\]/)
     expect(initializeScript).toMatch(/\[\[ "\$value" == "true" \]\]/)
     expect(initializeScript).not.toMatch(/\$role_ready" == "t"/)
-    expect(neonImportScript).toMatch(/contract_expect 'application schema USAGE'\s+'true'/)
 
     // The uncast probes in the same file must keep comparing against psql's
     // display form, which is the opposite mistake.
@@ -2023,11 +1910,9 @@ describe('the uploads ownership contract', () => {
 })
 
 describe('production can never re-run the Neon migration', () => {
-  it('keeps the Neon import structurally staging-only with no production override', () => {
-    expect(neonImportScript).toMatch(/if aau_env_is_production; then/)
-    expect(neonImportScript).toMatch(/STAGING ONLY/)
-    expect(neonImportScript).toMatch(/\[\[ "\$AAU_ENV" == "staging" \]\]/)
-    expect(neonImportScript).not.toMatch(/ALLOW_PRODUCTION|FORCE_PRODUCTION|AAU_ENV=production/)
+  it('no longer ships the Neon import tooling at all', () => {
+    expect(existsSync(path.resolve(REPO_ROOT, 'migration'))).toBe(false)
+    expect(existsSync(path.resolve(REPO_ROOT, 'tests/migration'))).toBe(false)
   })
 
   it.each([
@@ -2108,8 +1993,6 @@ describe('staging and production run one deployment engine', () => {
     //   seed.sh             the canonical Seed is staging-only
     //   seed-entrypoint.sh  the same refusal, hard-bound on the host
     expect(restoreScript).toMatch(/if aau_env_is_production; then/)
-    expect(read('deploy/scripts/seed.sh')).toMatch(/if aau_env_is_production; then/)
-    expect(read('deploy/scripts/seed-entrypoint.sh')).toMatch(/\[\[ "\$AAU_ENV" == "staging" \]\]/)
 
     // initialize-from-backup.sh is the fourth, and is a lineage TABLE rather
     // than a fork: the pair of (target, source) environments is matched, so a
