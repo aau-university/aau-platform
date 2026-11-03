@@ -37,7 +37,7 @@ Two environments, one host, sharing nothing but the kernel and Apache:
 | Stable port | `127.0.0.1:3000` | `127.0.0.1:13000` |
 | Candidate port | `127.0.0.1:3001` | `127.0.0.1:13001` |
 | Root | `/srv/aau/production` | `/srv/aau/staging` |
-| GHCR package | `…/aau-payload-platform` | `…/aau-payload-platform-staging` |
+| GHCR package | `ghcr.io/aau-university/aau-platform` | `ghcr.io/aau-university/aau-platform-staging` |
 
 Properties the design is built around:
 
@@ -70,7 +70,7 @@ cat /srv/aau/production/deploy/deployed-image
 deploy/scripts/compose.sh logs --tail 200 app-prod
 
 # Deploy a specific release (normally done by CI, not by hand)
-deploy/scripts/deploy.sh ghcr.io/<owner>/aau-payload-platform@sha256:<digest>
+deploy/scripts/deploy.sh ghcr.io/aau-university/aau-platform@sha256:<digest>
 
 # Backup on demand
 deploy/scripts/backup.sh
@@ -315,6 +315,12 @@ retention must therefore be at least as long as backup retention.
 Never run `docker system prune --volumes` on this host — it would destroy the
 database and the uploads. Retire images deliberately, after confirming no
 retained backup names them.
+
+Backups taken before the repository moved to `aau-university/aau-platform`
+record images in the old `ghcr.io/mohammed7779948484-tech/…` packages. They stay
+restorable — with exactly their recorded digest, never a rebuild — under the
+rules in [GHCR_CHANNEL_MIGRATION.md](GHCR_CHANNEL_MIGRATION.md), which also
+lists what must be copied before the old credentials are revoked.
 
 ---
 

@@ -618,11 +618,15 @@ describe('root deployment entrypoint', () => {
     // Channel: production and staging are DIFFERENT GHCR packages, so a staging
     // artifact is structurally incapable of entering the production path.
     expect(entrypointScript).toMatch(
-      /readonly EXPECTED_REPO="ghcr\.io\/mohammed7779948484-tech\/aau-payload-platform"/,
+      /readonly EXPECTED_REPO="ghcr\.io\/aau-university\/aau-platform" ;;/,
     )
     expect(entrypointScript).toMatch(
-      /readonly EXPECTED_REPO="ghcr\.io\/mohammed7779948484-tech\/aau-payload-platform-staging"/,
+      /readonly EXPECTED_REPO="ghcr\.io\/aau-university\/aau-platform-staging" ;;/,
     )
+    // The pre-migration packages are recovery-only (restore.sh); they are never
+    // a deployable channel at this privilege boundary.
+    expect(withoutComments(entrypointScript)).not.toMatch(/mohammed7779948484-tech/)
+    expect(withoutComments(entrypointScript)).not.toMatch(/aau-payload-platform/)
     expect(entrypointScript).toMatch(/not the approved \$\{AAU_ENV\} channel/)
     // Never from the environment: at a root boundary a `${VAR:-default}` could
     // be overridden by injection.
@@ -2136,7 +2140,7 @@ describe('staging and production run one deployment engine', () => {
       'AAU_ENV_ROOT', 'AAU_DEPLOY_ROOT', 'AAU_ENV_FILE', 'AAU_STATE_FILE',
       'AAU_LOCK_FILE', 'AAU_BACKUP_ROOT', 'AAU_UPLOADS_PATH',
       'AAU_PROJECT_NAME', 'AAU_APP_PORT', 'AAU_CANDIDATE_PORT',
-      'AAU_DOCKER_CONFIG',
+      'AAU_DOCKER_CONFIG', 'AAU_LEGACY_DOCKER_CONFIG',
     ]) {
       expect(environmentScript).toMatch(new RegExp(`${name}="\\$\\{`))
     }
@@ -2144,5 +2148,123 @@ describe('staging and production run one deployment engine', () => {
     // call shares /root/.docker/config.json and one login authorizes both
     // channels, undoing the package boundary the publish side is built on.
     expect(environmentScript).toMatch(/DOCKER_CONFIG="\$AAU_DOCKER_CONFIG"/)
+  })
+})
+
+/**
+ * The GHCR channel migration: the repository moved to aau-university/aau-platform
+ * and build-publish.yml derives its packages from `github.repository`, so the
+ * consumer side must name exactly the new packages -- and retained backups that
+ * recorded a complete pre-migration image reference must stay restorable
+ * without rewriting their metadata or widening the trust boundary.
+ * Behaviour is executed by tests/deploy/image-channel-drill.sh; these are the
+ * structural invariants that drill relies on.
+ */
+describe('the GHCR channel migration contract', () => {
+  const constant = (source: string, name: string) =>
+    source.match(new RegExp(`^readonly ${name}="([^"]+)"$`, 'm'))?.[1]
+  const entrypointRepo = (env: 'production' | 'staging') =>
+    entrypointScript.match(
+      new RegExp(`  ${env}\\)\\n    readonly EXPECTED_REPO="([^"]+)" ;;`),
+    )?.[1]
+
+  it('deploys and restores the SAME current package per environment', () => {
+    expect(entrypointRepo('production')).toBe('ghcr.io/aau-university/aau-platform')
+    expect(entrypointRepo('staging')).toBe('ghcr.io/aau-university/aau-platform-staging')
+    expect(constant(restoreScript, 'CURRENT_CHANNEL_PRODUCTION')).toBe(entrypointRepo('production'))
+    expect(constant(restoreScript, 'CURRENT_CHANNEL_STAGING')).toBe(entrypointRepo('staging'))
+  })
+
+  it('matches the packages build-publish.yml actually publishes from this repository', () => {
+    // Package = ghcr.io/<lowercased github.repository><suffix>, suffix `-staging`
+    // for the staging channel only.
+    expect(buildPublishWorkflow).toMatch(
+      /name="ghcr\.io\/\$\(echo "\$REPOSITORY" \| tr '\[:upper:\]' '\[:lower:\]'\)\$\{SUFFIX\}"/,
+    )
+    expect(buildPublishWorkflow).toMatch(/staging\)\s+echo "suffix=-staging" >> "\$GITHUB_OUTPUT"/)
+    const published = (suffix: string) => `ghcr.io/${'aau-university/aau-platform'.toLowerCase()}${suffix}`
+    expect(published('')).toBe(constant(restoreScript, 'CURRENT_CHANNEL_PRODUCTION'))
+    expect(published('-staging')).toBe(constant(restoreScript, 'CURRENT_CHANNEL_STAGING'))
+  })
+
+  it('recognises exactly one legacy package per environment, its own', () => {
+    expect(constant(restoreScript, 'LEGACY_CHANNEL_PRODUCTION')).toBe(
+      'ghcr.io/mohammed7779948484-tech/aau-payload-platform',
+    )
+    expect(constant(restoreScript, 'LEGACY_CHANNEL_STAGING')).toBe(
+      'ghcr.io/mohammed7779948484-tech/aau-payload-platform-staging',
+    )
+    const executable = withoutComments(restoreScript)
+    // Exactly the four constant definitions mention a GHCR owner; no glob,
+    // prefix or owner-only match anywhere else.
+    expect(executable.match(/ghcr\.io\/[a-z0-9-]+\//g)?.length).toBe(4)
+    // The only glob is the pre-existing "is this a ghcr.io reference at all"
+    // scope test; nothing matches an owner or package by pattern.
+    expect(executable.match(/ghcr\.io\/\*/g)).toEqual(['ghcr.io/*'])
+    expect(executable).toMatch(/if \[\[ "\$RESTORE_IMAGE" == ghcr\.io\/\* \]\]; then/)
+    expect(executable).not.toMatch(/ghcr\.io\/\$\{?[a-z_]*owner/i)
+    expect(executable).toMatch(
+      /production\)\n\s+expected_restore_repo="\$CURRENT_CHANNEL_PRODUCTION"\n\s+legacy_restore_repo="\$LEGACY_CHANNEL_PRODUCTION" ;;/,
+    )
+    expect(executable).toMatch(
+      /staging\)\n\s+expected_restore_repo="\$CURRENT_CHANNEL_STAGING"\n\s+legacy_restore_repo="\$LEGACY_CHANNEL_STAGING" ;;/,
+    )
+  })
+
+  it('accepts a legacy build only as the backup\'s own recorded pairing', () => {
+    const executable = withoutComments(restoreScript)
+    expect(executable).toMatch(
+      /elif \[\[ "\$restore_repository" == "\$legacy_restore_repo" \]\]; then\n\s+\[\[ -n "\$recorded_image" && "\$RESTORE_IMAGE" == "\$recorded_image" \]\] \\\n\s+\|\| fail/,
+    )
+    // The digest-only rule applies to the legacy channel too: it is checked
+    // before the repository branch, for every ghcr.io reference.
+    const digestAt = executable.indexOf('[[ "$RESTORE_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]]')
+    const branchAt = executable.indexOf('elif [[ "$restore_repository" == "$legacy_restore_repo" ]]')
+    expect(digestAt).toBeGreaterThan(-1)
+    expect(branchAt).toBeGreaterThan(digestAt)
+  })
+
+  it('obtains a legacy pairing by digest, current-channel copy first, never by rebuild', () => {
+    const executable = withoutComments(restoreScript)
+    const mirrorAt = executable.indexOf('mirrored_image="${expected_restore_repo}@${legacy_digest}"')
+    const pullMirrorAt = executable.indexOf('docker pull "$mirrored_image"')
+    const cacheAt = executable.indexOf('if image_has_repo_digest "$RESTORE_IMAGE"; then')
+    const legacyPullAt = executable.indexOf(
+      'DOCKER_CONFIG="$AAU_LEGACY_DOCKER_CONFIG" docker pull "$RESTORE_IMAGE"',
+    )
+    expect(mirrorAt).toBeGreaterThan(-1)
+    expect(pullMirrorAt).toBeGreaterThan(mirrorAt)
+    expect(cacheAt).toBeGreaterThan(pullMirrorAt)
+    expect(legacyPullAt).toBeGreaterThan(cacheAt)
+    // All three are verified against the image's own RepoDigests (the two
+    // pulls chain the check; the host-cache branch is the check itself).
+    expect(executable.match(/&& image_has_repo_digest "\$(mirrored_image|RESTORE_IMAGE)"/g)?.length).toBe(2)
+    // Metadata is history: restore.sh never writes it.
+    expect(executable).not.toMatch(/>\s*"?\$\{?metadata\}?"?/)
+    expect(executable).not.toMatch(/sed -i[^\n]*metadata/)
+    // It refuses, before the data services start, when no source yields it.
+    const refuseAt = executable.indexOf('cannot obtain the pre-migration build recorded with this backup')
+    const servicesAt = executable.indexOf('compose up --detach --wait postgres-prod redis-prod')
+    expect(refuseAt).toBeGreaterThan(-1)
+    expect(servicesAt).toBeGreaterThan(refuseAt)
+  })
+
+  it('keeps legacy recovery credentials separate and unexported', () => {
+    expect(environmentScript).toMatch(
+      /AAU_LEGACY_DOCKER_CONFIG="\$\{LEGACY_DOCKER_CONFIG:-\$\{AAU_ENV_ROOT\}\/docker-legacy\}"/,
+    )
+    // Never the ambient credential store.
+    expect(withoutComments(environmentScript)).not.toMatch(/DOCKER_CONFIG="\$AAU_LEGACY_DOCKER_CONFIG"/)
+    // Used for exactly one command in restore.sh, as a per-command prefix.
+    expect(withoutComments(restoreScript).match(/DOCKER_CONFIG="\$AAU_LEGACY_DOCKER_CONFIG"/g)?.length).toBe(1)
+    expect(withoutComments(read('deploy/scripts/deploy.sh'))).not.toMatch(/AAU_LEGACY_DOCKER_CONFIG/)
+    expect(withoutComments(read('deploy/scripts/backup.sh'))).not.toMatch(/AAU_LEGACY_DOCKER_CONFIG/)
+  })
+
+  it('runs the executable channel drill in the release gate', () => {
+    expect(read('.github/workflows/release-gate.yml')).toMatch(
+      /run: bash tests\/deploy\/image-channel-drill\.sh/,
+    )
+    expect(read('deploy/GHCR_CHANNEL_MIGRATION.md')).toMatch(/digest-preserving/)
   })
 })

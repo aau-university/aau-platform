@@ -40,8 +40,8 @@ chmod +x "${WORK}/bin/docker"
 
 # Minimal deploy root: an env file, a compose file, a recorded release.
 mkdir -p "${WORK}/deploy"
-RECORDED="ghcr.io/mohammed7779948484-tech/aau-payload-platform@sha256:$(printf 'a%.0s' {1..64})"
-OTHER="ghcr.io/mohammed7779948484-tech/aau-payload-platform@sha256:$(printf 'b%.0s' {1..64})"
+RECORDED="ghcr.io/aau-university/aau-platform@sha256:$(printf 'a%.0s' {1..64})"
+OTHER="ghcr.io/aau-university/aau-platform@sha256:$(printf 'b%.0s' {1..64})"
 printf '%s\n' "$RECORDED" > "${WORK}/deploy/deployed-image"
 cat > "${WORK}/deploy/.env.production" <<'EOF'
 POSTGRES_ADMIN_USER='aau_admin'
@@ -94,7 +94,7 @@ contains "the override is announced as acknowledged" "${WORK}/l4.out" "ACKNOWLED
 contains "it reached docker compose with the OVERRIDE digest" "${WORK}/l4" "sha256:bbbb"
 
 echo "=== 5. a non-digest-pinned APP_IMAGE is refused before anything else ==="
-rc="$(APP_IMAGE="ghcr.io/mohammed7779948484-tech/aau-payload-platform:latest" run "${WORK}/l5")"
+rc="$(APP_IMAGE="ghcr.io/aau-university/aau-platform:latest" run "${WORK}/l5")"
 check "a tag is refused" "$rc" "1"
 contains "the refusal explains identity must be a digest" "${WORK}/l5.out" "not digest-pinned"
 check "docker compose was NOT reached" \

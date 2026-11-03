@@ -274,8 +274,9 @@ jobs:
       # ── Provenance attestation ───────────────────────────────────────────
       # GitHub's artifact attestations are available for public repositories on
       # every plan, but for PRIVATE or internal repositories they require GitHub
-      # Enterprise Cloud. This repository is private and owned by a personal
-      # account, so on the current plan the attest step would FAIL — a
+      # Enterprise Cloud. This repository is private and owned by the
+      # aau-university organization; unless that organization is on GitHub
+      # Enterprise Cloud the attest step would FAIL — a
       # production workflow that is guaranteed to break the first time it is
       # used for real.
       #

@@ -311,8 +311,18 @@ describe('the import is staging-only and fails closed', () => {
     // invariant: in this deployment a release IS a digest.
     expect(importScript).toContain('@sha256:([a-f0-9]{64})$')
     const entrypoint = read('deploy/scripts/deploy-entrypoint.sh')
-    expect(entrypoint).toContain('ghcr.io/mohammed7779948484-tech/aau-payload-platform-staging')
     expect(entrypoint).toContain('@sha256:([a-f0-9]{64})$')
+    // After the GHCR channel migration the retired importer stays frozen on the
+    // PRE-migration staging package -- the one restore.sh knows as legacy --
+    // which the entrypoint no longer deploys. So no current-channel release can
+    // ever satisfy the importer: it cannot be re-run by accident.
+    expect(read('deploy/scripts/restore.sh')).toContain(
+      'readonly LEGACY_CHANNEL_STAGING="ghcr.io/mohammed7779948484-tech/aau-payload-platform-staging"',
+    )
+    expect(entrypoint).toContain('readonly EXPECTED_REPO="ghcr.io/aau-university/aau-platform-staging"')
+    expect(entrypoint.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n')).not.toContain(
+      'aau-payload-platform-staging',
+    )
   })
 })
 

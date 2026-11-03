@@ -74,6 +74,16 @@ aau_env_resolve() {
   DOCKER_CONFIG="$AAU_DOCKER_CONFIG"
   export DOCKER_CONFIG
 
+  # ── Pre-migration recovery credentials (optional, per environment) ──────
+  # A Docker credential store holds ONE login per registry host, and both the
+  # current and the pre-migration packages live on ghcr.io. So read access to
+  # this environment's OLD package, if it is kept for recovery, cannot share
+  # AAU_DOCKER_CONFIG. It lives in its own root-only directory, is never
+  # exported as DOCKER_CONFIG, and restore.sh consults it for exactly one
+  # pull: a backup's own recorded pre-migration build. Absent = not used.
+  # See deploy/GHCR_CHANNEL_MIGRATION.md.
+  AAU_LEGACY_DOCKER_CONFIG="${LEGACY_DOCKER_CONFIG:-${AAU_ENV_ROOT}/docker-legacy}"
+
   # Loopback bind for the stable service port. The reverse proxy (cPanel Apache
   # on the real host) forwards a public HTTPS vhost to exactly one of these.
   case "$env_name" in
@@ -88,7 +98,8 @@ aau_env_resolve() {
 
   export AAU_ENV AAU_ENV_ROOT AAU_DEPLOY_ROOT AAU_ENV_FILE AAU_COMPOSE_FILE \
     AAU_STATE_FILE AAU_LOCK_FILE AAU_BACKUP_ROOT AAU_UPLOADS_PATH \
-    AAU_PROJECT_NAME AAU_APP_PORT AAU_CANDIDATE_PORT AAU_DOCKER_CONFIG
+    AAU_PROJECT_NAME AAU_APP_PORT AAU_CANDIDATE_PORT AAU_DOCKER_CONFIG \
+    AAU_LEGACY_DOCKER_CONFIG
 }
 
 # aau_state_image — the digest recorded by the last successful deploy/restore,

@@ -49,11 +49,12 @@ dump_env() {
     # separate, and which this drill exists to prove.
     unset DEPLOY_ROOT ENV_FILE COMPOSE_FILE STATE_FILE LOCK_FILE BACKUP_ROOT \
       UPLOADS_HOST_PATH COMPOSE_PROJECT_NAME AAU_ENV_ROOT AAU_APP_PORT AAU_CANDIDATE_PORT \
-      DOCKER_CONFIG
+      DOCKER_CONFIG LEGACY_DOCKER_CONFIG
     aau_env_resolve "$1"
     printf '%s\n' "$AAU_ENV_ROOT" "$AAU_DEPLOY_ROOT" "$AAU_ENV_FILE" "$AAU_STATE_FILE" \
       "$AAU_LOCK_FILE" "$AAU_BACKUP_ROOT" "$AAU_UPLOADS_PATH" "$AAU_PROJECT_NAME" \
-      "$AAU_APP_PORT" "$AAU_CANDIDATE_PORT" "$AAU_DOCKER_CONFIG"
+      "$AAU_APP_PORT" "$AAU_CANDIDATE_PORT" "$AAU_DOCKER_CONFIG" \
+      "$AAU_LEGACY_DOCKER_CONFIG"
   )
 }
 
@@ -72,6 +73,7 @@ readonly LABELS=(
   "stable host port"
   "candidate host port"
   "registry credential store"
+  "pre-migration recovery credential store"
 )
 
 echo "1. every piece of environment state is distinct"

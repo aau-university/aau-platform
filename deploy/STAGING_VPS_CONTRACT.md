@@ -146,7 +146,7 @@ deploy/scripts/                 -> /srv/aau/<env>/deploy/scripts/
 | Release state | `/srv/aau/production/deploy/deployed-image` | `/srv/aau/staging/deploy/deployed-image` |
 | Operation lock | `/srv/aau/production/deploy/locks/operations.lock` | `/srv/aau/staging/deploy/locks/operations.lock` |
 | Env file | `/srv/aau/production/deploy/.env.production` | `/srv/aau/staging/deploy/.env.staging` |
-| GHCR package | `ghcr.io/mohammed7779948484-tech/aau-payload-platform` | `…-staging` |
+| GHCR package | `ghcr.io/aau-university/aau-platform` | `ghcr.io/aau-university/aau-platform-staging` |
 
 The **candidate** bind is where a new release is health-gated before it is
 allowed onto the stable port. No reverse proxy may ever be pointed at it.

@@ -94,11 +94,22 @@ readonly REQUESTED_DIGEST="sha256:${BASH_REMATCH[2]}"
 # path. Separate GHCR packages make that a property of the reference itself,
 # not a convention: the production entrypoint simply does not accept a staging
 # repository name.
+#
+# These are the packages build-publish.yml publishes from the
+# aau-university/aau-platform repository. They MUST match restore.sh's
+# CURRENT_CHANNEL_* constants (asserted by the deployment-contract tests).
+#
+# The pre-migration packages under ghcr.io/mohammed7779948484-tech/ are NOT
+# deployable here, in either environment. A deployment moves an environment
+# forward to a new release; historical builds paired with retained backups are
+# a RECOVERY concern and are handled, under tighter rules, by restore.sh. To
+# run a historical build forward, copy it digest-for-digest into the current
+# package first (see deploy/GHCR_CHANNEL_MIGRATION.md).
 case "$AAU_ENV" in
   production)
-    readonly EXPECTED_REPO="ghcr.io/mohammed7779948484-tech/aau-payload-platform" ;;
+    readonly EXPECTED_REPO="ghcr.io/aau-university/aau-platform" ;;
   staging)
-    readonly EXPECTED_REPO="ghcr.io/mohammed7779948484-tech/aau-payload-platform-staging" ;;
+    readonly EXPECTED_REPO="ghcr.io/aau-university/aau-platform-staging" ;;
 esac
 
 if [[ "$REQUESTED_REPO" != "$EXPECTED_REPO" ]]; then

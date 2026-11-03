@@ -72,6 +72,13 @@ jobs:
         # waited out, and a permanently active writer fails the freeze. No real
         # stack, so it belongs with the other no-Docker host-script drills.
         run: bash tests/deploy/writers-freeze-drill.sh
+      # The GHCR channel contract after the move to aau-university/aau-platform:
+      # the real deploy-entrypoint.sh accepts only each environment's current
+      # package, and the real restore.sh can still honour a retained backup's
+      # recorded pre-migration build -- that exact digest only, never a
+      # widened owner/package. Docker stub, no registry.
+      - name: GHCR channel and pre-migration recovery drill
+        run: bash tests/deploy/image-channel-drill.sh
       # The Neon -> VPS migration tooling's fail-closed contract: the
       # staging-only guard, the export integrity envelope, the Public Media
       # scope (Private Media binaries stay out), and an unmeasurable value

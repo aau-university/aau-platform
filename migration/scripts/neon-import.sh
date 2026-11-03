@@ -355,8 +355,14 @@ import_repository="${BASH_REMATCH[1]}"
 
 # CHANNEL — the exact package published for staging, matched in full. A suffix
 # heuristic is not a boundary: `ghcr.io/attacker/anything-staging` would pass
-# one. This constant MUST match deploy-entrypoint.sh's staging EXPECTED_REPO
-# and restore.sh's staging channel.
+# one.
+#
+# Deliberately FROZEN on the pre-migration staging package (restore.sh's
+# LEGACY_CHANNEL_STAGING; see deploy/GHCR_CHANNEL_MIGRATION.md). The one-time
+# Neon import was completed and accepted on that channel and is retired: no
+# release in the current aau-university package can satisfy this check, so the
+# importer cannot be re-run against one. Do not "update" it to the current
+# channel.
 readonly EXPECTED_IMPORT_REPO='ghcr.io/mohammed7779948484-tech/aau-payload-platform-staging'
 [[ "$import_repository" == "$EXPECTED_IMPORT_REPO" ]] \
   || fail "REFUSING: the recorded release is not from the approved staging channel.

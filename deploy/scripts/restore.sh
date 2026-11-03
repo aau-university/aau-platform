@@ -432,36 +432,59 @@ fi
 #      repository identity -- the same boundary deploy-entrypoint.sh enforces.
 #
 #      A suffix heuristic (reject `*-staging` in production; require it in
-#      staging) is NOT a release boundary: `ghcr.io/attacker/aau-payload-platform`
+#      staging) is NOT a release boundary: `ghcr.io/attacker/aau-platform`
 #      passes the production test, and `ghcr.io/attacker/anything-staging` passes
 #      the staging test. The trust boundary is the exact package published by
-#      build-publish.yml, so the reference must equal it exactly. These two
+#      build-publish.yml, so the reference must equal it exactly. The CURRENT
 #      constants MUST match deploy-entrypoint.sh's EXPECTED_REPO.
 #
 #      Scoped to ghcr.io references, because that is the only registry whose
 #      naming this contract governs; local and test registries are unaffected.
+#
+# ── The GHCR channel migration (see deploy/GHCR_CHANNEL_MIGRATION.md) ─────
+# The packages moved when the repository moved to aau-university/aau-platform.
+# Backups taken before that move record, in metadata.json, the COMPLETE image
+# reference of the build they pair with -- under the old namespace. That record
+# is history and is never rewritten.
+#
+# So exactly one LEGACY package per environment is still recognised, and only
+# for recovery, never for deployment:
+#
+#   * it is the same environment's pre-migration package, matched exactly
+#     (never another owner, never the other environment's package);
+#   * it is accepted ONLY when RESTORE_IMAGE is byte-for-byte the image this
+#     backup recorded -- i.e. the backup's own pairing. An operator cannot name
+#     an arbitrary historical digest from the old package; and a cross-
+#     environment restore, whose recorded image is by definition someone
+#     else's, cannot use the legacy channel at all;
+#   * the build is then obtained by digest, so whatever is started IS the
+#     recorded build (see 1.6b). No rebuild is ever assumed to be equivalent.
+readonly CURRENT_CHANNEL_PRODUCTION="ghcr.io/aau-university/aau-platform"
+readonly CURRENT_CHANNEL_STAGING="ghcr.io/aau-university/aau-platform-staging"
+readonly LEGACY_CHANNEL_PRODUCTION="ghcr.io/mohammed7779948484-tech/aau-payload-platform"
+readonly LEGACY_CHANNEL_STAGING="ghcr.io/mohammed7779948484-tech/aau-payload-platform-staging"
+
+LEGACY_PAIRING=false
 if [[ "$RESTORE_IMAGE" == ghcr.io/* ]]; then
   restore_repository="${RESTORE_IMAGE%%@*}"
   restore_repository="${restore_repository%%:*}"
   case "$AAU_ENV" in
-    production) expected_restore_repo="ghcr.io/mohammed7779948484-tech/aau-payload-platform" ;;
-    staging)    expected_restore_repo="ghcr.io/mohammed7779948484-tech/aau-payload-platform-staging" ;;
-    *)          fail "no known GHCR channel for environment '${AAU_ENV}'; refusing to authorize a ghcr.io restore image" ;;
+    production)
+      expected_restore_repo="$CURRENT_CHANNEL_PRODUCTION"
+      legacy_restore_repo="$LEGACY_CHANNEL_PRODUCTION" ;;
+    staging)
+      expected_restore_repo="$CURRENT_CHANNEL_STAGING"
+      legacy_restore_repo="$LEGACY_CHANNEL_STAGING" ;;
+    *)
+      fail "no known GHCR channel for environment '${AAU_ENV}'; refusing to authorize a ghcr.io restore image" ;;
   esac
-  [[ "$restore_repository" == "$expected_restore_repo" ]] \
-    || fail "REFUSING: ${RESTORE_IMAGE} is not the approved ${AAU_ENV} channel.
-  expected repository: ${expected_restore_repo}
-  got:                 ${restore_repository}
-  A staging artifact is never a production artifact, and vice versa; and a
-  third-party repository is never either. Pass a ${AAU_ENV}-channel image via
-  RESTORE_IMAGE."
 
-  # Immutable, or not at all. The test above validates the REPOSITORY, which
-  # `${expected_restore_repo}:latest` also satisfies while naming whatever that
-  # tag points at today — and this value is exported as APP_IMAGE, started, and
-  # written to the release-state file as this environment's release identity. A
-  # restore that cannot say which exact build now pairs with the restored
-  # schema has not restored a known state.
+  # Immutable, or not at all. The repository test below would also be
+  # satisfied by `${expected_restore_repo}:latest`, which names whatever that
+  # tag points at today -- and this value is exported as APP_IMAGE, started,
+  # and written to the release-state file as this environment's release
+  # identity. A restore that cannot say which exact build now pairs with the
+  # restored schema has not restored a known state.
   #
   # Scoped to ghcr.io with the rest of this gate: the local and test registries
   # this contract does not govern push tags deliberately, and the real host
@@ -471,6 +494,100 @@ if [[ "$RESTORE_IMAGE" == ghcr.io/* ]]; then
   A ${AAU_ENV} release must be restored by immutable digest —
   ${expected_restore_repo}@sha256:<64 hex> — because a tag names whatever it
   points at today, and this reference becomes the recorded release identity."
+
+  if [[ "$restore_repository" == "$expected_restore_repo" ]]; then
+    :
+  elif [[ "$restore_repository" == "$legacy_restore_repo" ]]; then
+    [[ -n "$recorded_image" && "$RESTORE_IMAGE" == "$recorded_image" ]] \
+      || fail "REFUSING: ${RESTORE_IMAGE} is in the pre-migration ${AAU_ENV} package
+  (${legacy_restore_repo}), which is recognised ONLY to restore a backup with
+  the exact build that backup recorded.
+  this backup recorded: ${recorded_image:-<nothing>}
+  requested:            ${RESTORE_IMAGE}
+  Restore this backup with its own recorded image, or name a build in the
+  current ${AAU_ENV} channel: ${expected_restore_repo}@sha256:<64 hex>."
+    LEGACY_PAIRING=true
+    log "this backup pairs with a pre-migration ${AAU_ENV} build: ${RESTORE_IMAGE}"
+  else
+    fail "REFUSING: ${RESTORE_IMAGE} is not the approved ${AAU_ENV} channel.
+  expected repository: ${expected_restore_repo}
+  got:                 ${restore_repository}
+  A staging artifact is never a production artifact, and vice versa; and a
+  third-party repository is never either. Pass a ${AAU_ENV}-channel image via
+  RESTORE_IMAGE."
+  fi
+fi
+
+# 1.6b Obtain the exact build.
+#
+#      Current channel: the local image, else a pull with this environment's
+#      own credential store -- unchanged from before the migration.
+#
+#      Legacy pairing: the recorded DIGEST is the identity, not the old
+#      repository name. Three sources, in order, each of which can only yield
+#      the build with that digest (a pull by digest is verified by the registry
+#      client against the content address, and the result is then re-checked
+#      against the image's RepoDigests):
+#
+#        1. the same digest in the CURRENT package -- a digest-preserving copy
+#           made by an operator before the old namespace is retired. Preferred:
+#           it is the path that survives revoking the old credentials, and the
+#           release-state file then records a current-channel reference.
+#        2. the recorded reference already present on this host. A cache is
+#           not a retention policy, so this is never the only path offered.
+#        3. a pull of the recorded reference through a SEPARATE, root-only,
+#           per-environment legacy credential store (AAU_LEGACY_DOCKER_CONFIG),
+#           used for this one pull and for nothing else. It exists only while
+#           the old namespace is kept readable for recovery.
+#
+#      If none yields the build, the restore refuses before anything is
+#      touched: the backup is intact, but its pairing cannot be honoured.
+
+# True when the local image <ref> lists exactly <ref> among its RepoDigests,
+# i.e. it really is that digest in that repository.
+image_has_repo_digest() {
+  local ref="$1" listed
+  while IFS= read -r listed; do
+    [[ "$listed" == "$ref" ]] && return 0
+  done < <(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$ref" 2>/dev/null)
+  return 1
+}
+
+if [[ "$BASELINE_RECOVERY" != "true" && "$LEGACY_PAIRING" == "true" ]]; then
+  legacy_digest="${RESTORE_IMAGE##*@}"
+  mirrored_image="${expected_restore_repo}@${legacy_digest}"
+  legacy_sources_tried=()
+
+  if docker pull "$mirrored_image" >/dev/null 2>&1 \
+      && image_has_repo_digest "$mirrored_image"; then
+    log "using the digest-identical copy in the current ${AAU_ENV} channel: ${mirrored_image}"
+    log "  (this backup recorded ${RESTORE_IMAGE}; same content address)"
+    RESTORE_IMAGE="$mirrored_image"
+  else
+    legacy_sources_tried+=("current-channel copy ${mirrored_image}: not obtainable")
+    if image_has_repo_digest "$RESTORE_IMAGE"; then
+      log "using the recorded pre-migration build already present on this host"
+    else
+      legacy_sources_tried+=("recorded build on this host: not present")
+      if [[ -d "$AAU_LEGACY_DOCKER_CONFIG" ]] \
+          && DOCKER_CONFIG="$AAU_LEGACY_DOCKER_CONFIG" docker pull "$RESTORE_IMAGE" >/dev/null \
+          && image_has_repo_digest "$RESTORE_IMAGE"; then
+        log "pulled the recorded pre-migration build through ${AAU_LEGACY_DOCKER_CONFIG}"
+      else
+        legacy_sources_tried+=("legacy credential store ${AAU_LEGACY_DOCKER_CONFIG}: absent or pull failed")
+        printf '[restore]   - %s\n' "${legacy_sources_tried[@]}" >&2
+        fail "cannot obtain the pre-migration build recorded with this backup: ${RESTORE_IMAGE}
+
+  The backup is intact, but none of the three sources for its paired build
+  yielded that exact digest (listed above). Nothing has been touched.
+
+  Make ${mirrored_image} available (a digest-preserving copy into the current
+  ${AAU_ENV} package), or provide read access to the old package through
+  ${AAU_LEGACY_DOCKER_CONFIG}. Do NOT rebuild and do NOT edit metadata.json:
+  a rebuild is a different build. See deploy/GHCR_CHANNEL_MIGRATION.md."
+      fi
+    fi
+  fi
 fi
 
 # From here on every compose call is for this restore's target release.

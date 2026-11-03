@@ -218,24 +218,34 @@ echo "=== A7. a ghcr restore image is authorized by EXACT repository, not a suff
 # credential would slip an attacker image into production.
 readonly HEX64="sha256:0000000000000000000000000000000000000000000000000000000000000000"
 for bad in \
-  "ghcr.io/attacker/aau-payload-platform@${HEX64}" \
-  "ghcr.io/mohammed7779948484-tech/aau-payload-platform-staging@${HEX64}" \
-  "ghcr.io/mohammed7779948484-tech/aau-payload-platform-staging-evil@${HEX64}"; do
+  "ghcr.io/attacker/aau-platform@${HEX64}" \
+  "ghcr.io/aau-university/aau-platform-staging@${HEX64}" \
+  "ghcr.io/aau-university/aau-platform-staging-evil@${HEX64}" \
+  "ghcr.io/mohammed7779948484-tech/aau-payload-platform-staging@${HEX64}"; do
   as_env production RESTORE_IMAGE="$bad" \
     bash "${ROOT}/deploy/scripts/restore.sh" "$BACKUP" > "${ROOT}/a7.log" 2>&1
   check "refused a non-approved production repository (${bad##*/})" "$?" "1"
   contains "the refusal names it a channel mismatch" "${ROOT}/a7.log" \
     "not the approved production channel"
 done
+# The pre-migration production package is recovery-only: it is accepted solely
+# as a backup's OWN recorded build, and this backup did not record it.
+as_env production RESTORE_IMAGE="ghcr.io/mohammed7779948484-tech/aau-payload-platform@${HEX64}" \
+  bash "${ROOT}/deploy/scripts/restore.sh" "$BACKUP" > "${ROOT}/a7legacy.log" 2>&1
+check "refused a pre-migration build this backup did not record" "$?" "1"
+contains "the refusal names the recorded-pairing rule" "${ROOT}/a7legacy.log" \
+  "recognised ONLY to restore a backup with"
 # The exact approved production repository is NOT rejected at the channel gate
 # (it fails later, at the pull, which proves it passed the identity check).
-as_env production RESTORE_IMAGE="ghcr.io/mohammed7779948484-tech/aau-payload-platform@${HEX64}" \
+as_env production RESTORE_IMAGE="ghcr.io/aau-university/aau-platform@${HEX64}" \
   bash "${ROOT}/deploy/scripts/restore.sh" "$BACKUP" > "${ROOT}/a7ok.log" 2>&1
 if grep -qF "not the approved production channel" "${ROOT}/a7ok.log"; then
   printf '  FAIL the exact approved production repository was rejected at the channel gate\n'; fail=$((fail + 1))
 else
   printf '  ok   the exact approved production repository passes the channel gate\n'; pass=$((pass + 1))
 fi
+contains "it reached image acquisition for that exact build" "${ROOT}/a7ok.log" \
+  "restoring with application image ghcr.io/aau-university/aau-platform@${HEX64}"
 
 echo
 echo "=== B1. a foreign database session blocks the restore ==="

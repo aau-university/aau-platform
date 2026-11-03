@@ -297,7 +297,7 @@ production package, never a tag.
 ```bash
 # Normal deploy, on the VPS
 /srv/aau/production/deploy/scripts/deploy.sh \
-  ghcr.io/<owner>/aau-payload-platform@sha256:<digest>
+  ghcr.io/aau-university/aau-platform@sha256:<digest>
 ```
 
 The deploy script takes the shared operation lock (deploy, restore, backup and
