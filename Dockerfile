@@ -2,7 +2,7 @@
 # This build uses BuildKit-only features (`RUN --mount=type=cache`), so the
 # Dockerfile frontend is declared explicitly rather than relying on the
 # daemon's default.
-FROM node:24.19.0-bookworm-slim@sha256:a9f5f7c91a432850b2a8a7797adf5eadb6c733ceed61167806cee7ea7fbc29df AS base
+FROM node:26.13.1-bookworm-slim@sha256:5df79989ed685e09f0a98019db4cebfb22fb9df1a53c0161664a011f7ff6b0f1 AS base
 
 ENV PNPM_HOME=/pnpm
 ENV COREPACK_HOME=/usr/local/share/corepack
@@ -96,7 +96,7 @@ RUN PAYLOAD_SECRET=build-only-non-production-secret-not-used-at-runtime \
   pnpm run build
 
 # Production image, copy all the files and run next
-FROM node:24.19.0-bookworm-slim@sha256:a9f5f7c91a432850b2a8a7797adf5eadb6c733ceed61167806cee7ea7fbc29df AS runner
+FROM node:26.13.1-bookworm-slim@sha256:5df79989ed685e09f0a98019db4cebfb22fb9df1a53c0161664a011f7ff6b0f1 AS runner
 WORKDIR /app
 
 ENV NODE_ENV=production
